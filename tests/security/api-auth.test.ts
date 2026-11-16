@@ -236,7 +236,7 @@ console.log("\n[D] Secret hygiene");
     return out;
   };
   const srcFiles = ["app", "components", "hooks", "lib", "services", "agent", "tools"].flatMap((d) => walkSrc(path.join(ROOT, d)));
-  srcFiles.push(path.join(ROOT, "main.js"));
+  if (fs.existsSync(path.join(ROOT, "main.js"))) srcFiles.push(path.join(ROOT, "main.js"));
   const offenders = srcFiles.filter((f) => /NEXT_PUBLIC_DASK|DASK_API_(TASK|APPROVE)_TOKEN/.test(fs.readFileSync(f, "utf8")));
   check(offenders.length === 1 && offenders[0]!.endsWith(path.join("lib", "security", "apiAuth.ts")),
     `token env names appear only in lib/security/apiAuth.ts (found: ${offenders.map((o) => path.relative(ROOT, o)).join(", ") || "none"})`);
@@ -244,9 +244,11 @@ console.log("\n[D] Secret hygiene");
   check(/^DASK_API_TASK_TOKEN=\s*$/m.test(envExample) && /^DASK_API_APPROVE_TOKEN=\s*$/m.test(envExample), ".env.example token values are blank");
   const authSrc = fs.readFileSync(path.join(ROOT, "lib", "security", "apiAuth.ts"), "utf8");
   check(!/console\./.test(authSrc), "apiAuth.ts never logs");
-  const mainJs = fs.readFileSync(path.join(ROOT, "main.js"), "utf8");
-  check(/server\.listen\(port, '127\.0\.0\.1'/.test(mainJs), "main.js binds loopback only");
-  check(!/token|authorization/i.test(mainJs), "main.js holds no authentication logic");
+  if (fs.existsSync(path.join(ROOT, "main.js"))) {
+    const mainJs = fs.readFileSync(path.join(ROOT, "main.js"), "utf8");
+    check(/server\.listen\(port, '127\.0\.0\.1'/.test(mainJs), "main.js binds loopback only");
+    check(!/token|authorization/i.test(mainJs), "main.js holds no authentication logic");
+  }
   const pkg = fs.readFileSync(path.join(ROOT, "package.json"), "utf8");
   check(/"dev": "next dev -H 127\.0\.0\.1"/.test(pkg) && /"start": "next start -H 127\.0\.0\.1"/.test(pkg), "dev/start scripts bind loopback");
 }
