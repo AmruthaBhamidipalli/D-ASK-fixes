@@ -36,6 +36,21 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (typeof body.objective !== "string") {
+      return NextResponse.json(
+        { error: "objective must be a string" },
+        { status: 400 }
+      );
+    }
+
+
+    if (body.objective.length > 2000) {
+      return NextResponse.json(
+        { error: "objective is too long (max 2000 characters)" },
+        { status: 400 }
+      );
+    }
+
     if (!body.objective?.trim()) {
       return NextResponse.json(
         { error: "objective is required" },
