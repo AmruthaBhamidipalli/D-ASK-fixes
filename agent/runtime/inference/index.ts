@@ -38,7 +38,7 @@ export function getLocalSupervisor(): InferenceSupervisor {
   const g = globalThis as unknown as Record<symbol, InferenceSupervisor | undefined>;
   const backend = process.env.DASK_LOCAL_BACKEND as "auto" | Backend | undefined;
   return (g[SUPERVISOR_KEY] ??= new InferenceSupervisor({
-    modelId: process.env.DASK_LOCAL_MODEL || undefined,
+    modelId: process.env.DASK_LOCAL_MODEL || "qwen2.5-1.5b-instruct-q4_k_m",
     backend: backend === "vulkan" || backend === "cpu" ? backend : "auto",
     contextSize: intEnv("DASK_LOCAL_CTX"),
     idleUnloadMs: intEnv("DASK_LOCAL_IDLE_MS"),
