@@ -33,6 +33,9 @@ class Scripted implements LanguageModel {
 const GRANTS = new Set<ToolPermission>([...DEFAULT_GRANTS, "read:desktop", "request:desktop_action"]);
 const run = (bridge: DesktopBridge, model: LanguageModel, objective: string) =>
   new AgentRuntime({ model, registry: createDefaultRegistry(ROOT, { desktop: bridge }), granted: GRANTS }).run({ taskId: `t${Math.random()}`.replace(".", ""), objective });
+/** The model is asked to plan (request-derived plans off): tests that a MODEL's different values never reach the daemon. */
+const runModel = (bridge: DesktopBridge, model: LanguageModel, objective: string) =>
+  new AgentRuntime({ model, registry: createDefaultRegistry(ROOT, { desktop: bridge }), granted: GRANTS, requestPlans: false }).run({ taskId: `t${Math.random()}`.replace(".", ""), objective });
 
 async function main() {
   console.log("\n[G] Grammar");
@@ -77,7 +80,7 @@ async function main() {
     check(r.outcome === "completed" && d.calls.length === 1 && JSON.stringify(d.calls[0]!.args) === JSON.stringify({ radio: "wifi", state: "off" }) && /read back/.test(r.response),
       "E1 turn off Wi-Fi: exactly the request's radio and state reach the daemon; completed only when read back", { o: r.outcome, r: r.response, c: d.calls });
     const d2 = new FakeDaemon([{ status: "ok", result: { verified: true } } as any]);
-    const r2 = await run(d2, new Scripted([plan([{ id: "s1", tool: "system.set_radio", input: { radio: "bluetooth", state: "off" } }])]), "Turn off Wi-Fi");
+    const r2 = await runModel(d2, new Scripted([plan([{ id: "s1", tool: "system.set_radio", input: { radio: "bluetooth", state: "off" } }])]), "Turn off Wi-Fi");
     check(r2.outcome !== "completed" && d2.calls.length === 0, "E2 a different radio planned by the model never reaches the daemon");
   }
   {

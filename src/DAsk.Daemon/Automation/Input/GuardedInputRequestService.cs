@@ -52,7 +52,20 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
     private bool Enabled(InputKind k) => (k == InputKind.Mouse ? _options.MouseEnabled : _options.KeyboardEnabled) && _evidence != null && _isSessionLive != null;
 
     private sealed record Request(string Tool, string ActionType, InputKind Kind, string? Process, string? TitleContains, ControlSelector Control, string? Text, KeyChords.Chord? Chord,
-        ControlSelector? To = null, string? Direction = null, int Amount = 0);
+        ControlSelector? To = null, string? Direction = null, int Amount = 0, bool EditorRole = false);
+
+    /// <summary>element { "role": "editor" }: the main editor of the window D-ASK opened for this task (typing only).</summary>
+    public static readonly ControlSelector EditorSelector = new("Editor", null, "main editor");
+
+    /// <summary>
+    /// Never typed into through the editor role, whatever their focus shows: consoles and shells (typed text is a command line) and
+    /// browsers (the focus is the address bar). Typing there still needs an explicitly named control, as before.
+    /// </summary>
+    public static readonly IReadOnlySet<string> EditorRoleDenied = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "cmd.exe", "powershell.exe", "pwsh.exe", "WindowsTerminal.exe", "OpenConsole.exe", "conhost.exe", "wsl.exe", "bash.exe", "wt.exe",
+        "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "iexplore.exe",
+    };
 
     private string? Parse(string tool, JsonElement args, out Request req)
     {
@@ -60,6 +73,7 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
         if (args.ValueKind != JsonValueKind.Object) return "arguments must be an object";
         string? process = null, title = null, text = null, keys = null, direction = null;
         int amount = 3;
+        bool editor = false;
         ControlSelector? control = null, to = null;
         foreach (var p in args.EnumerateObject())
         {
@@ -70,13 +84,21 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
                 case "element":
                 case "to" when tool == GuardedInputTools.Drag:
                     if (p.Value.ValueKind != JsonValueKind.Object) return $"{p.Name} must be an object {{ controlType, automationId?, name? }}";
-                    string? ct = null, aid = null, nm = null;
+                    string? ct = null, aid = null, nm = null, role = null;
                     foreach (var e in p.Value.EnumerateObject())
                     {
                         if (e.Value.ValueKind != JsonValueKind.String) return $"element.{e.Name} must be text";
                         string v = e.Value.GetString()!;
                         if (v.Length > 200) return $"element.{e.Name} is too long";
-                        switch (e.Name) { case "controlType": ct = v.Trim(); break; case "automationId": aid = v; break; case "name": nm = v; break; default: return $"unknown element field '{(e.Name.Length > 30 ? e.Name[..30] : e.Name)}'"; }
+                        switch (e.Name) { case "controlType": ct = v.Trim(); break; case "automationId": aid = v; break; case "name": nm = v; break; case "role" when p.Name == "element": role = v; break; default: return $"unknown element field '{(e.Name.Length > 30 ? e.Name[..30] : e.Name)}'"; }
+                    }
+                    if (role != null)
+                    {
+                        if (role != "editor") return "element.role must be \"editor\"";
+                        if (ct != null || aid != null || nm != null) return "element.role is given alone (no controlType, automationId or name)";
+                        if (tool != GuardedInputTools.TypeText) return "element.role \"editor\" is accepted only for typing text";
+                        editor = true; control = EditorSelector;
+                        break;
                     }
                     if (string.IsNullOrWhiteSpace(ct)) return "element.controlType is required";
                     if (string.IsNullOrEmpty(aid) && string.IsNullOrEmpty(nm)) return "element needs an automationId or a name";
@@ -95,7 +117,8 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
                 default: return $"unknown argument '{(p.Name.Length > 40 ? p.Name[..40] : p.Name)}'"; // never coordinates, handles, key codes or approvals
             }
         }
-        if (DesktopReadService.ValidateSelector(process, title) is { } bad) return bad;
+        // The editor role may omit the window selector: the window is then the one this daemon opened for the task (checked in RunAsync).
+        if (!(editor && process == null && title == null) && DesktopReadService.ValidateSelector(process, title) is { } bad) return bad;
         if (control == null) return "element is required";
         KeyChords.Chord? chord = null;
         if (tool == GuardedInputTools.TypeText && TextRules.Validate(text, _options.MaxTextLength) is { } tbad) return tbad;
@@ -111,7 +134,7 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
             GuardedInputTools.Drag => new Request(tool, DesktopActionTypes.Drag, InputKind.Mouse, process, title, control, null, null, to),
             GuardedInputTools.SelectText => new Request(tool, DesktopActionTypes.SelectText, InputKind.Keyboard, process, title, control, text, null),
             GuardedInputTools.ClickElement => new Request(tool, DesktopActionTypes.ClickElement, InputKind.Mouse, process, title, control, null, null),
-            GuardedInputTools.TypeText => new Request(tool, DesktopActionTypes.TypeText, InputKind.Keyboard, process, title, control, text, null),
+            GuardedInputTools.TypeText => new Request(tool, DesktopActionTypes.TypeText, InputKind.Keyboard, process, title, control, text, null, EditorRole: editor),
             _ => new Request(tool, DesktopActionTypes.PressKeys, InputKind.Keyboard, process, title, control, null, chord),
         };
         return null;
@@ -148,24 +171,50 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
             ? _reader.ResolveLaunched(lw.Hwnd, lw.ProcessId, lw.ProcessCreationFileTime, r.Process, r.TitleContains) : null;
         // A window D-ASK itself opened for this task may retitle itself as its content changes (Notepad: "*HELLO - Notepad"). Only for typing.
         bool titleMayFollowContent = target != null && r.Tool == GuardedInputTools.TypeText;
+        // The editor role without a window selector exists only for the window D-ASK opened for THIS task. With a selector (the user named
+        // the application: "type hello in Word"), the window is resolved like any other: exactly one window, never a guess.
+        if (r.EditorRole && target == null && r.Process == null && r.TitleContains == null)
+            return DesktopCallResult.Fail("editor_needs_launch",
+                "D-ASK types into an application's document without a named window only in the window it opened for this same request (for example \"open Word and type hello\"), and that window is not open (any more). Nothing was asked or done.");
         if (target == null && _reader.ResolveTarget(r.Process, r.TitleContains, "acted on", out target) is { } notResolved) return notResolved;
+        // Typing into a document changes its title ("*Untitled - Notepad"): the application part must stay; identity is still checked before every key.
+        titleMayFollowContent |= r.EditorRole;
         if (WindowIdentityRules.Incomplete(target!) is { } why)
             return DesktopCallResult.Fail("identity_uncertain", $"The window's identity cannot be established ({why}); nothing can be requested for it.");
         if (_options.DeniedImageNames.Contains(target!.ImageName))
             return DesktopCallResult.Fail("target_forbidden", $"{target.ImageName} never receives input from D-ASK.");
+        if (r.EditorRole && EditorRoleDenied.Contains(target.ImageName))
+            return DesktopCallResult.Fail("target_forbidden", $"D-ASK does not type into {target.ImageName} without a named control (consoles run typed text as commands; a browser's focus is its address bar). Nothing was asked.");
         var (allowed, risk, policyReason) = _policy.EvaluatePolicy(r.ActionType, new Dictionary<string, string>(), target.ImageName);
         if (allowed || risk != ActionRiskLevel.Elevated) return DesktopCallResult.Fail("policy_denied", $"The policy does not permit this request ({policyReason}).");
 
-        // The control: exactly one element, resolved by the daemon from a complete inspection.
-        var insp = await Inspect(target.Hwnd, ct);
-        if (ControlResolver.Resolve(insp, r.Control, out var control) is { } rf)
+        // The control: exactly one element, resolved by the daemon from a complete inspection (or, for the editor role, the window's
+        // main editor resolved directly through UI Automation: large windows such as Word exceed the bounded inspection).
+        UiaInspection insp;
+        ControlIdentity? control;
+        if (r.EditorRole)
         {
-            // Control identifiers only (they are shown in approvals anyway); never typed text.
-            _logger?.LogInformation("[DesktopInput] {Tool} for task {TaskId}: control {Selector} not resolved ({Code}; inspection {Status}, {Count} elements).",
-                r.Tool, ctx.TaskId, r.Control.Describe(), rf.Code, insp.Status, insp.Nodes.Count);
-            return DesktopCallResult.Fail(rf.Code, rf.Message);
+            insp = EditorInspection();
+            control = _platform.FindEditor(target.Hwnd, target.ProcessId);
+            if (control == null)
+            {
+                _logger?.LogInformation("[DesktopInput] {Tool} for task {TaskId}: no main editor found in the launched window ({Image}).", r.Tool, ctx.TaskId, target.ImageName);
+                return DesktopCallResult.Fail("target_not_found",
+                    $"\"{target.Title}\" ({target.ImageName}) does not show one document or text area that can take typing (it may still be on a start screen or dialog). Nothing was asked or typed.");
+            }
         }
-        if (ControlResolver.Revalidate(control!, insp, out _) is { } unusable) return DesktopCallResult.Fail(unusable.Code, unusable.Message);
+        else
+        {
+            insp = await Inspect(target.Hwnd, ct);
+            if (ControlResolver.Resolve(insp, r.Control, out control) is { } rf)
+            {
+                // Control identifiers only (they are shown in approvals anyway); never typed text.
+                _logger?.LogInformation("[DesktopInput] {Tool} for task {TaskId}: control {Selector} not resolved ({Code}; inspection {Status}, {Count} elements).",
+                    r.Tool, ctx.TaskId, r.Control.Describe(), rf.Code, insp.Status, insp.Nodes.Count);
+                return DesktopCallResult.Fail(rf.Code, rf.Message);
+            }
+            if (ControlResolver.Revalidate(control!, insp, out _) is { } unusable) return DesktopCallResult.Fail(unusable.Code, unusable.Message);
+        }
         var (cx, cy) = control!.Center;
         var wb = target.Bounds;
         if (wb.Length != 4 || cx < wb[0] || cx >= wb[2] || cy < wb[1] || cy >= wb[3])
@@ -186,7 +235,15 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
             var (dx, dy) = dest.Center;
             if (dx < wb[0] || dx >= wb[2] || dy < wb[1] || dy >= wb[3]) return DesktopCallResult.Fail("target_unusable", "The drop target is not inside the window's visible area.");
         }
-        if (r.Tool == GuardedInputTools.TypeText)
+        if (r.Tool == GuardedInputTools.TypeText && r.EditorRole)
+        {
+            // A document editor (Word exposes TextPattern, not ValuePattern): its text must be readable so the typing can be verified.
+            if (!_platform.ReadEditorText(target.Hwnd, control.RuntimeId).Ok)
+                return DesktopCallResult.Fail("target_unusable", "The document's text cannot be read, so typing could not be verified; nothing was asked.");
+            if (control.Patterns.Contains("Value") && _platform.ReadValue(target.Hwnd, control.RuntimeId) is { Ok: true, ReadOnly: true })
+                return DesktopCallResult.Fail("target_unusable", "The text field is read-only.");
+        }
+        else if (r.Tool == GuardedInputTools.TypeText)
         {
             if (!control.Patterns.Contains("Value")) return DesktopCallResult.Fail("target_unusable", "The control is not an editable text field.");
             var v0 = _platform.ReadValue(target.Hwnd, control.RuntimeId);
@@ -299,6 +356,17 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
             await AuditAsync("DesktopInputTargetChanged", request, ctx, r, control, "Refused", wchanged.Message, target);
             return DesktopCallResult.Fail(wchanged.Code, $"You approved it, but {wchanged.Message}. Nothing was done.");
         }
+        if (r.EditorRole)
+        {
+            // The same editor, re-resolved after the approval: same runtime id, type, name and automation id, in the same window.
+            var again = _platform.FindEditor(target.Hwnd, target.ProcessId);
+            if (again == null || !again.RuntimeId.AsSpan().SequenceEqual(control.RuntimeId) || again.ControlType != control.ControlType || again.Name != control.Name || again.AutomationId != control.AutomationId)
+            {
+                await AuditAsync("DesktopInputTargetChanged", request, ctx, r, control, "Refused", "editor changed", target);
+                return DesktopCallResult.Fail(again == null ? "target_disappeared" : "target_changed", "You approved it, but the document the text was approved for is no longer the window's editor. Nothing was done.");
+            }
+            return await ExecuteApprovedAsync(request, ctx, r, target, control, EditorInspection(), decidedMs, ct, null);
+        }
         var insp2 = await Inspect(target.Hwnd, ct);
         if (ControlResolver.Revalidate(control, insp2, out var control2) is { } cchanged)
         {
@@ -321,6 +389,9 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
     }
 
     public const string TitleFollowsContentKey = "titleNote";
+
+    /// <summary>The editor role resolves its control directly; there is no tree inspection to compare (typing is verified by the text).</summary>
+    private static UiaInspection EditorInspection() => new("ok", Array.Empty<UiaNode>(), false, DateTimeOffset.UtcNow, "editor role");
 
     private static string VerbFor(string tool) => tool switch
     {
@@ -427,7 +498,14 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
             }
             if (r.Kind == InputKind.Keyboard)
             {
-                _platform.FocusElement(target.Hwnd, control.RuntimeId);
+                bool HasFocus() => _platform.FocusedRuntimeId() is { } f0 && f0.AsSpan().SequenceEqual(control.RuntimeId);
+                // A document editor gets its focus back when its window comes to the front: observed for a moment before asking for it.
+                if (r.EditorRole)
+                {
+                    var esw = Stopwatch.StartNew();
+                    while (!HasFocus() && esw.ElapsedMilliseconds < 600) { try { await Task.Delay(30, ct); } catch (OperationCanceledException) { break; } }
+                }
+                if (!HasFocus()) _platform.FocusElement(target.Hwnd, control.RuntimeId);
                 if (_platform.FocusedRuntimeId() is not { } fid || !fid.AsSpan().SequenceEqual(control.RuntimeId))
                 {
                     await AuditAsync("DesktopInputExecutionRefused", request, ctx, r, control, "Refused", "focus not on the control", target);
@@ -435,7 +513,17 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
                 }
                 // Text entry is verified by exact insertion; a key chord on a value control by any change of its value
                 // (password fields are refused before this point, so no secret is ever read).
-                if (control.Patterns.Contains("Value")) valueBefore = _platform.ReadValue(target.Hwnd, control.RuntimeId).Value;
+                if (r.EditorRole)
+                {
+                    var t0 = _platform.ReadEditorText(target.Hwnd, control.RuntimeId);
+                    if (!t0.Ok)
+                    {
+                        await AuditAsync("DesktopInputExecutionRefused", request, ctx, r, control, "Refused", "editor text unreadable", target);
+                        return DesktopCallResult.Fail("target_unusable", "The document's text could not be read just before typing, so typing could not be verified. Nothing was done.");
+                    }
+                    valueBefore = t0.Text;
+                }
+                else if (control.Patterns.Contains("Value")) valueBefore = _platform.ReadValue(target.Hwnd, control.RuntimeId).Value;
             }
 
             var steps = r.Tool switch
@@ -501,10 +589,22 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
 
         // Independent verification from a fresh observation.
         var vsw = Stopwatch.StartNew();
-        bool verified = false; string observed = "no change observed";
+        bool verified = false, autoCorrected = false; string observed = "no change observed";
         while (vsw.ElapsedMilliseconds < _options.VerifyTimeoutMs && !ct.IsCancellationRequested)
         {
-            if (r.Tool == GuardedInputTools.TypeText)
+            if (r.Tool == GuardedInputTools.TypeText && r.EditorRole)
+            {
+                var v = _platform.ReadEditorText(target.Hwnd, control.RuntimeId);
+                if (v.Ok && TextRules.IsExactInsertion(valueBefore, v.Text, r.Text!)) { verified = true; observed = "the document now contains exactly the typed text, inserted once"; break; }
+                if (v.Ok && TextRules.IsInsertionAllowingAutoCorrect(valueBefore, v.Text, r.Text!))
+                {
+                    verified = true; autoCorrected = true;
+                    observed = "the document now contains the typed text, inserted once; the application's AutoCorrect changed its letter case or quote marks";
+                    break;
+                }
+                if (v.Ok) observed = "the document's text does not show the typed text inserted exactly once";
+            }
+            else if (r.Tool == GuardedInputTools.TypeText)
             {
                 var v = _platform.ReadValue(target.Hwnd, control.RuntimeId);
                 if (v.Ok && TextRules.IsExactInsertion(valueBefore, v.Value, r.Text!)) { verified = true; observed = "the field now contains exactly the typed text, inserted once"; break; }
@@ -563,6 +663,8 @@ public sealed class GuardedInputRequestService : IDesktopActionRequestService
             control = new { controlType = control.ControlType, automationId = control.AutomationId, name = control.Name },
             keys = r.Chord?.Canonical,
             textLength = r.Text?.Length,
+            autoCorrected = r.EditorRole ? autoCorrected : (bool?)null,
+            editorRole = r.EditorRole,
             direction = r.Direction,
             amount = r.Tool == GuardedInputTools.Scroll ? r.Amount : (int?)null,
             dropTarget = dest == null ? null : new { controlType = dest.ControlType, automationId = dest.AutomationId, name = dest.Name },

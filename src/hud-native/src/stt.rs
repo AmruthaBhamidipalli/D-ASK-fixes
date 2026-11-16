@@ -24,16 +24,60 @@ pub fn validate_wav(bytes: &[u8]) -> Result<(), &'static str> {
 /// Engine-neutral entry point: whisper.cpp when it is installed, verified and allowed, and the audio is 16 kHz mono;
 /// otherwise (or if whisper fails) the Windows SAPI recognizer. Returns the text and the engine that produced it.
 pub fn transcribe(root: &Path, path: &Path, wav: &[u8]) -> Result<(String, &'static str), String> {
-    if crate::whisper::whisper_allowed() && crate::whisper::wav_is_whisper_ready(wav) {
+    transcribe_detailed(root, path, wav).map(|t| (t.text, t.engine))
+}
+
+/// What actually produced a transcript (QA BUG-003, 2026-11-16): the engine that ANSWERED, and, when the Windows recognizer answered
+/// although whisper is preferred, why whisper was not used. Never inferred from configuration alone.
+#[derive(Debug, Clone)]
+pub struct Transcript {
+    pub text: String,
+    pub engine: &'static str,
+    pub fallback_reason: Option<String>,
+}
+
+pub fn transcribe_detailed(root: &Path, path: &Path, wav: &[u8]) -> Result<Transcript, String> {
+    let skipped: Option<String> = if !crate::whisper::whisper_allowed() {
+        None   // the user chose the Windows recognizer (DASK_STT_ENGINE=sapi): not a fallback
+    } else if !crate::whisper::wav_is_whisper_ready(wav) {
+        Some("the audio is not 16 kHz mono, which whisper needs".to_string())
+    } else {
         match crate::whisper::locate(root) {
             Ok(engine) => match engine.transcribe(path, MAX_TRANSCRIBE) {
-                Ok(text) => return Ok((normalize_quotes(&text), "whisper-local")),
-                Err(e) => tracing::warn!("[STT] whisper failed ({e}); using the Windows recognizer"),
+                Ok(text) => return Ok(Transcript { text: normalize_quotes(&text), engine: "whisper-local", fallback_reason: None }),
+                Err(e) => Some(format!("whisper failed ({e})")),
             },
-            Err(why) => tracing::debug!("[STT] whisper not available ({why}); using the Windows recognizer"),
+            Err(why) => Some(format!("whisper is not available ({why})")),
         }
+    };
+    if let Some(why) = &skipped { tracing::warn!("[STT] Using the Windows recognizer instead of whisper: {why}"); }
+    match transcribe_wav(path) {
+        Ok(t) => Ok(Transcript { text: normalize_quotes(&t), engine: "sapi-local", fallback_reason: skipped }),
+        Err(e) => Err(match skipped {
+            Some(why) => format!("speech could not be recognised: {why}, and the Windows recognizer failed ({e})"),
+            None => format!("speech could not be recognised: the Windows recognizer failed ({e})"),
+        }),
     }
-    transcribe_wav(path).map(|t| (normalize_quotes(&t), "sapi-local"))
+}
+
+/// Which engine voice input will use, VERIFIED now (every pinned whisper file and the model hashed), not read from configuration.
+pub fn engine_status(root: &Path) -> serde_json::Value {
+    let allowed = crate::whisper::whisper_allowed();
+    let located = crate::whisper::locate(root);
+    let (verified, reason, model) = match &located {
+        Ok(e) => (true, None, Some(e.model_id.clone())),
+        Err(why) => (false, Some(why.clone()), None),
+    };
+    let active = if allowed && verified { "whisper-local" } else { "sapi-local" };
+    serde_json::json!({
+        "active": active,
+        "preferred": if allowed { "whisper-local" } else { "sapi-local" },
+        "whisper": { "verified": verified, "model": model, "reason": reason, "switchedOff": !allowed },
+        "fallback": "sapi-local",
+        "note": if active == "whisper-local" { "whisper.cpp (offline) is verified and used; the Windows recognizer is used only if whisper fails on a recording" }
+                else if !allowed { "the Windows recognizer was chosen (DASK_STT_ENGINE=sapi)" }
+                else { "whisper.cpp is not usable, so the Windows recognizer (offline, less accurate on names) is used" },
+    })
 }
 
 /// Dictated quotation marks, for both engines. Quoted text is what the input grammar types EXACTLY (always shown on the
@@ -161,6 +205,46 @@ mod tests {
         v.extend(16u32.to_le_bytes()); v.extend(fmt.to_le_bytes()); v.extend(1u16.to_le_bytes()); v.extend(rate.to_le_bytes());
         v.extend((rate * 2).to_le_bytes()); v.extend(2u16.to_le_bytes()); v.extend(bits.to_le_bytes()); v.extend(b"data"); v.extend(0u32.to_le_bytes());
         v
+    }
+
+    /// QA BUG-003: without a verified whisper install the status says so, with the reason, and never claims whisper is active.
+    #[test]
+    fn status_without_whisper_reports_the_windows_recognizer_and_why() {
+        let empty = std::env::temp_dir().join(format!("dask-stt-status-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let s = engine_status(&empty);
+        assert_eq!(s["active"], "sapi-local");
+        assert_eq!(s["whisper"]["verified"], false);
+        assert!(s["whisper"]["reason"].as_str().unwrap().contains("no whisper manifest"));
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// The repository's pinned whisper install (when present) is VERIFIED by hashing before it is reported active.
+    #[test]
+    fn status_with_the_pinned_whisper_install_is_verified_by_hash() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        if !root.join("local-inference/whisper.cpp/models/ggml-base.en-q5_1.bin").exists() { return; }   // not provisioned here
+        let s = engine_status(&root);
+        assert_eq!(s["whisper"]["verified"], true, "{s}");
+        assert_eq!(s["active"], if crate::whisper::whisper_allowed() { "whisper-local" } else { "sapi-local" });
+    }
+
+    /// Audio whisper cannot take is recognised by the Windows engine, and the reason is reported (not hidden in a debug log).
+    #[test]
+    fn non_16k_audio_names_the_fallback_reason_or_fails_with_it() {
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!("dask-stt-8k-{}.wav", std::process::id()));
+        let mut bytes = wav(8000, 16, 1);
+        bytes.extend(std::iter::repeat(0u8).take(16000));
+        let n = (bytes.len() - 44) as u32;
+        bytes[40..44].copy_from_slice(&n.to_le_bytes());
+        std::fs::write(&p, &bytes).unwrap();
+        let r = transcribe_detailed(&dir, &p, &bytes);
+        let _ = std::fs::remove_file(&p);
+        match r {
+            Ok(t) => { assert_eq!(t.engine, "sapi-local"); if crate::whisper::whisper_allowed() { assert!(t.fallback_reason.unwrap().contains("16 kHz")); } }
+            Err(e) => assert!(e.contains("Windows recognizer failed"), "{e}"),
+        }
     }
 
     #[test]

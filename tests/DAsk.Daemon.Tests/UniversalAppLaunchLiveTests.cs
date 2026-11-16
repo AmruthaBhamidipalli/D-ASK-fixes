@@ -121,7 +121,7 @@ public class UniversalAppLaunchLiveTests
             Assert.True(chrome.Status == "ok", "Chrome: " + chrome.Error?.Message);
             Assert.True(code.Status == "ok", "VS Code: " + code.Error?.Message);
             Assert.True(excel.Status == "ok", "Excel: " + excel.Error?.Message);
-            if (offline) Assert.True(search.Error?.Code == "offline_mode", "Chrome search offline: expected the offline refusal, got " + (search.Error?.Code ?? search.Status));
+            if (offline) Assert.True(search.Error?.Code == "web_search_disabled", "Chrome search offline: expected the offline refusal, got " + (search.Error?.Code ?? search.Status));
             else Assert.True(search.Status == "ok", "Chrome search: " + search.Error?.Message);
             Assert.True(project.Status == "ok", "VS Code project: " + project.Error?.Message);
             Assert.True(settings.Status == "ok", "Settings: " + settings.Error?.Message);

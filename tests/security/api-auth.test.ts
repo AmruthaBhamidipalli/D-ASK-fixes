@@ -235,8 +235,11 @@ console.log("\n[D] Secret hygiene");
     }
     return out;
   };
-  const srcFiles = ["app", "components", "hooks", "lib", "services", "agent", "tools"].flatMap((d) => walkSrc(path.join(ROOT, d)));
-  if (fs.existsSync(path.join(ROOT, "main.js"))) srcFiles.push(path.join(ROOT, "main.js"));
+  // 2026-11-16: the Electron launcher (main.js) was removed with the move to the native host. Its successors are scanned instead:
+  // the Rust HUD (serves the frontend in-process) and the .NET daemon / Chrome relay (named-pipe and native-messaging IPC only).
+  const srcFiles = ["app", "components", "hooks", "lib", "services", "agent", "tools", "src/hud-native/src", "src/DAsk.Daemon", "src/DAsk.ChromeHost", "src/DAsk.Protocol"]
+    .filter((d) => fs.existsSync(path.join(ROOT, d))).flatMap((d) => walkSrc(path.join(ROOT, d)));
+  check(srcFiles.some((f) => f.endsWith(path.join("hud-native", "src", "main.rs"))), "the native HUD host source is part of the scan");
   const offenders = srcFiles.filter((f) => /NEXT_PUBLIC_DASK|DASK_API_(TASK|APPROVE)_TOKEN/.test(fs.readFileSync(f, "utf8")));
   check(offenders.length === 1 && offenders[0]!.endsWith(path.join("lib", "security", "apiAuth.ts")),
     `token env names appear only in lib/security/apiAuth.ts (found: ${offenders.map((o) => path.relative(ROOT, o)).join(", ") || "none"})`);
@@ -244,11 +247,40 @@ console.log("\n[D] Secret hygiene");
   check(/^DASK_API_TASK_TOKEN=\s*$/m.test(envExample) && /^DASK_API_APPROVE_TOKEN=\s*$/m.test(envExample), ".env.example token values are blank");
   const authSrc = fs.readFileSync(path.join(ROOT, "lib", "security", "apiAuth.ts"), "utf8");
   check(!/console\./.test(authSrc), "apiAuth.ts never logs");
-  if (fs.existsSync(path.join(ROOT, "main.js"))) {
-    const mainJs = fs.readFileSync(path.join(ROOT, "main.js"), "utf8");
-    check(/server\.listen\(port, '127\.0\.0\.1'/.test(mainJs), "main.js binds loopback only");
-    check(!/token|authorization/i.test(mainJs), "main.js holds no authentication logic");
-  }
+  // Constant-time comparison: fixed-length SHA-256 digests compared with timingSafeEqual against BOTH tokens; never ===/!== on a token.
+  check(/timingSafeEqual\(candidate,\s*taskDigest\)/.test(authSrc) && /timingSafeEqual\(candidate,\s*approveDigest\)/.test(authSrc)
+    && /createHash\("sha256"\)/.test(authSrc), "tokens are compared in constant time (SHA-256 digests + timingSafeEqual, both scopes evaluated)");
+  check(!/(token|candidate|Digest)\s*[!=]==\s*(?!null|undefined)\w/.test(authSrc), "no direct equality comparison of token material");
+  check(!fs.existsSync(path.join(ROOT, "main.js")), "no Electron launcher (main.js) is present: Electron stays excluded");
+}
+
+// ── E. Native host boundaries (successor of the Electron launcher checks) ────
+console.log("\n[E] Native host: no network listener, frontend only through its own origin, no API-token logic");
+{
+  const hudDir = path.join(ROOT, "src", "hud-native", "src");
+  const hudSrc = fs.readdirSync(hudDir).filter((f) => f.endsWith(".rs")).map((f) => fs.readFileSync(path.join(hudDir, f), "utf8")).join("\n");
+  const cargo = fs.readFileSync(path.join(ROOT, "src", "hud-native", "Cargo.toml"), "utf8");
+  check(!/\bTcpListener\b|\bUdpSocket\b|\.listen\(|\bHttpServer\b/.test(hudSrc), "HUD host opens no TCP/UDP listener (the frontend is not served over the network)");
+  check(!/^\s*(tiny_http|hyper|axum|warp|actix-web|rocket)\s*=/m.test(cargo), "HUD host depends on no HTTP server crate");
+  check(/with_asynchronous_custom_protocol\(\s*"dask"/.test(hudSrc) && /with_url\(\s*"dask:\/\/localhost\/"\s*\)/.test(hudSrc),
+    "HUD loads the frontend only from its in-process dask://localhost protocol");
+  check(/is_trusted_origin\s*=\s*uri_str\.starts_with\("dask:\/\/localhost"\)\s*\|\|\s*uri_str\.starts_with\("http:\/\/dask\.localhost"\)/.test(hudSrc),
+    "camera/microphone permissions are granted only to D-ASK's own origin");
+  check(/COREWEBVIEW2_PERMISSION_STATE_DENY/.test(hudSrc), "untrusted permission requests are denied explicitly");
+  // (The HUD names "obsolete_authorization_message" when it REFUSES a retired page message; that is not header handling.)
+  check(!/DASK_API_(TASK|APPROVE)_TOKEN|\bBearer\b|["']authorization["']|AUTHORIZATION\b/.test(hudSrc), "HUD host holds no API-token or Authorization-header logic");
+  const daemonCs: string[] = [];
+  (function walk(d: string) {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      if (["bin", "obj"].includes(e.name)) continue;
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p); else if (e.name.endsWith(".cs")) daemonCs.push(p);
+    }
+  })(path.join(ROOT, "src", "DAsk.Daemon"));
+  const tcp = daemonCs.filter((f) => /\bTcpListener\b|\bHttpListener\b|\bUseUrls\(|\bKestrel/.test(fs.readFileSync(f, "utf8")));
+  check(daemonCs.length > 50 && tcp.length === 0, `daemon opens no TCP/HTTP listener (named-pipe IPC only; found: ${tcp.map((f) => path.relative(ROOT, f)).join(", ") || "none"})`);
+  const loopback = fs.readFileSync(path.join(ROOT, "agent", "runtime", "inference", "loopback.ts"), "utf8");
+  check(/export function isLoopbackHost/.test(loopback) && /127\\\.\(\\d\{1,3\}\)/.test(loopback), "local model server addresses are restricted to literal loopback");
   const pkg = fs.readFileSync(path.join(ROOT, "package.json"), "utf8");
   check(/"dev": "next dev -H 127\.0\.0\.1"/.test(pkg) && /"start": "next start -H 127\.0\.0\.1"/.test(pkg), "dev/start scripts bind loopback");
 }

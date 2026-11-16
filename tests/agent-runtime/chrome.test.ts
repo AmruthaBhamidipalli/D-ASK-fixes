@@ -26,6 +26,8 @@ class Scripted implements LanguageModel {
 }
 const GRANTS = new Set<ToolPermission>([...DEFAULT_GRANTS, "read:desktop", "request:desktop_action"]);
 const run = (b: DesktopBridge, m: LanguageModel, o: string) => new AgentRuntime({ model: m, registry: createDefaultRegistry(ROOT, { desktop: b }), granted: GRANTS }).run({ taskId: `t${Math.random()}`.replace(".", ""), objective: o });
+/** The model is asked to plan (request-derived plans off): tests that a MODEL's different values never reach Chrome. */
+const runModel = (b: DesktopBridge, m: LanguageModel, o: string) => new AgentRuntime({ model: m, registry: createDefaultRegistry(ROOT, { desktop: b }), granted: GRANTS, requestPlans: false }).run({ taskId: `t${Math.random()}`.replace(".", ""), objective: o });
 
 async function main() {
   console.log("\n[G] Grammar (only requests that name Chrome)");
@@ -56,7 +58,7 @@ async function main() {
     const r = await run(d, new Scripted(plan([{ id: "s1", tool: "chrome.open", input: { url: "github.com" } }])), "Open github.com in Chrome");
     check(r.outcome === "completed" && d.calls[0]?.tool === "chrome.open" && (d.calls[0]!.args as any).url === "github.com" && /GitHub/.test(r.response), "E1 open a site in Chrome; completed from Chrome's reported address", { o: r.outcome, r: r.response });
     const d2 = new FakeDaemon([{ status: "ok", result: { verified: true } } as any]);
-    const r2 = await run(d2, new Scripted(plan([{ id: "s1", tool: "chrome.open", input: { url: "evil.example" } }])), "Open github.com in Chrome");
+    const r2 = await runModel(d2, new Scripted(plan([{ id: "s1", tool: "chrome.open", input: { url: "evil.example" } }])), "Open github.com in Chrome");
     check(r2.outcome !== "completed" && d2.calls.length === 0, "E2 a different address planned by the model never reaches Chrome");
   }
   {

@@ -1,6 +1,7 @@
 /**
  * Phase 7B.1b — read-only desktop intelligence, agent side.
  * Run with: npx tsx tests/agent-runtime/desktop.test.ts
+ * Runs on the MODEL-plan path (requestPlans: false): request-derived planning is covered by any-app-session.test.ts.
  *
  *   P. protocol v2 parsing (hello offer, replies)
  *   B. DaemonCallBridge (call lines, correlation, cancel, timeout, disconnect)
@@ -93,7 +94,10 @@ class Scripted implements LanguageModel {
 }
 const GRANTS = new Set<ToolPermission>([...DEFAULT_GRANTS, "read:desktop", "request:desktop_action"]);
 const run = (bridge: DesktopBridge, model: LanguageModel, objective: string, granted: ReadonlySet<ToolPermission> = GRANTS) =>
-  new AgentRuntime({ model, registry: createDefaultRegistry(ROOT, { desktop: bridge }), granted }).run({ taskId: `t${Math.random()}`.replace(".", ""), objective });
+  new AgentRuntime({ model, registry: createDefaultRegistry(ROOT, { desktop: bridge }), granted, requestPlans: false }).run({ taskId: `t${Math.random()}`.replace(".", ""), objective });
+/** The model is asked to plan (request-derived plans off): tests that a MODEL's different values never reach the daemon. */
+const runModel = (bridge: DesktopBridge, model: LanguageModel, objective: string) =>
+  new AgentRuntime({ model, registry: createDefaultRegistry(ROOT, { desktop: bridge }), granted: GRANTS, requestPlans: false }).run({ taskId: `t${Math.random()}`.replace(".", ""), objective });
 
 async function main(): Promise<void> {
   // ── P ──────────────────────────────────────────────────────────────────────
@@ -225,12 +229,15 @@ async function main(): Promise<void> {
 
     // P1/P2 superseded the blanket click refusal: ONE element-bound click / quoted text / allowed chord is an approval request.
     // Everything else that acts is still refused up front (more forms than before).
-    for (const q of ["Close the Notepad window", "Type hello into the Notepad window", "Minimize Notepad and then type hello", "Scroll down in the window titled \"Report\"", "Resize the Excel window",
+    for (const q of ["Close the Notepad window", "Minimize Notepad and then type hello", "Scroll down in the window titled \"Report\"", "Resize the Excel window",
       "Drag the file into the Notepad window", "Click the OK button in Notepad and then close it"]) {
       check(actuationRefusal(q) !== null, `R18 actuation is refused up front: ${q}`);
     }
     check(actuationRefusal("Click the OK button in Notepad") === null && requestedInputAction("Click the OK button in Notepad")?.tool === "desktop.click_element",
       "R18b one element-bound click is an approval request (P1), not refused");
+    // 2026-11-16: typing into a named application's main editor ("type hello into the Notepad window") is an approval request, not refused.
+    check(actuationRefusal("Type hello into the Notepad window") === null && requestedInputAction("Type hello into the Notepad window")?.tool === "desktop.type_text",
+      "R18c typing into a named application's editor is an approval request");
     for (const q of ["What windows are open?", "check which apps are running", "Inspect the Notepad window", "Is Notepad open?", "what time is it?"]) {
       check(actuationRefusal(q) === null, `R19 read-only request is not refused: ${q}`);
     }
@@ -1051,7 +1058,7 @@ async function main(): Promise<void> {
       const r = await run(d, new Scripted([plan([{ id: "s1", tool: "desktop.clipboard_write", input: { text: "meeting at 5" } }])]), q);
       check(r.outcome === "completed" && d.calls[0]?.tool === "desktop.clipboard_write" && (d.calls[0]?.args as { text: string }).text === "meeting at 5", "K15 clipboard write with exactly the quoted text", { o: r.outcome, r: r.response });
       const d2 = new FakeDaemon([{ status: "ok", result: { executed: true, verified: true } }]);
-      const r2 = await run(d2, new Scripted([plan([{ id: "s1", tool: "desktop.clipboard_write", input: { text: "something else" } }])]), q);
+      const r2 = await runModel(d2, new Scripted([plan([{ id: "s1", tool: "desktop.clipboard_write", input: { text: "something else" } }])]), q);
       check(r2.outcome !== "completed" && d2.calls.length === 0, "K16 other text never reaches the clipboard");
       const d3 = new FakeDaemon([{ status: "ok", result: { executed: true, verified: true, hasText: true, text: "hello", length: 5, truncated: false } }]);
       const r3 = await run(d3, new Scripted([plan([{ id: "s1", tool: "desktop.clipboard_read", input: {} }])]), "What's on my clipboard?");

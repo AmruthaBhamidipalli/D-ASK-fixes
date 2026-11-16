@@ -276,6 +276,11 @@ export interface Plan {
    * retained step it duplicated. Ids and tool names only; never inputs.
    */
   removedDuplicateSteps?: { id: string; duplicateOf: string; tool: string }[];
+  /**
+   * Set by the runtime (never the model): "request" when every step was derived from the request text itself (a tool claimed the
+   * whole request and its deterministic check produced each step's exact input), so no model was asked to plan. Absent: model plan.
+   */
+  source?: "request";
 }
 
 // ── Execution state ──────────────────────────────────────────────────────────
@@ -310,7 +315,8 @@ export interface VerificationReport {
   criteriaSatisfied: boolean | null;
   needsMoreSteps: boolean;
   missing: string[];
-  method: "evidence+model" | "evidence-only";
+  /** "evidence+request": a request-derived plan (Plan.source) whose every facet the daemon verified; no model judgement was needed. */
+  method: "evidence+model" | "evidence-only" | "evidence+request";
   notes: string[];
   /** Deterministic grounding verdict per executed step. */
   grounding: { stepId: string; tool: string; status: GroundingStatus; reason: string }[];

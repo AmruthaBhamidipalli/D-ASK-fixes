@@ -342,13 +342,34 @@ public class Win32ScreenObservationService : IScreenObservationService
             targetDisplay = displays.FirstOrDefault(d => wx >= d.X && wx < d.X + d.Width && wy >= d.Y && wy < d.Y + d.Height) ?? targetDisplay;
         }
         var capturedAt = DateTimeOffset.UtcNow;
-        bool captureFailed = false;
+        bool captureFailed = false, desktopUnavailable = false;
         string? captureError = null;
 
         int captureX = targetDisplay.X;
         int captureY = targetDisplay.Y;
         int captureWidth = targetDisplay.Width;
         int captureHeight = targetDisplay.Height;
+
+        // No interactive desktop (service/background window station, locked or secure desktop, disconnected session): whatever a blit
+        // would return there (an error, or a blank frame of an invisible desktop) is not an observation of the user's screen. Refused
+        // before anything is captured. Also no display surface at all: a failure with its reason, never an exception.
+        var desktopNow = ProbeDesktop();
+        if (captureWidth <= 0 || captureHeight <= 0 || !desktopNow.Interactive)
+        {
+            var d = desktopNow;
+            _logger?.LogWarning("[Observation] Screen capture refused: {Reason}", d.Reason ?? "no display surface");
+            return new CaptureObservationResponse
+            {
+                RequestId = request.RequestId, ObservationId = observationId, Timestamp = DateTimeOffset.UtcNow, Success = false,
+                Status = "DesktopUnavailable", RejectionCode = "DesktopUnavailable", CaptureStatus = "desktop_unavailable", UiaStatus = "Skipped",
+                ErrorMessage = !d.Interactive
+                    ? $"No interactive desktop is available to capture: {d.Reason}. Nothing was captured."
+                    : $"No display surface is available to capture ({captureWidth}x{captureHeight}). Nothing was captured.",
+                CapturedAtUtc = capturedAt, ExpiresAtUtc = capturedAt + ObservationMaxAge, IsAtomic = false, DisplayIndex = targetDisplay.Index,
+                PhysicalWidth = 0, PhysicalHeight = 0, DpiScale = targetDisplay.DpiScale, SharedMemoryName = string.Empty, DataSizeBytes = 0,
+                Format = "raw_bgra32", AllDisplays = displays,
+            };
+        }
 
         // Perform GDI Screen Capture using DIBSection
         IntPtr hdcScreen = GetDC(IntPtr.Zero);
@@ -399,7 +420,17 @@ public class Win32ScreenObservationService : IScreenObservationService
             if (!bitBltSuccess)
             {
                 captureFailed = true;
-                captureError = "BitBlt failed for both capture modes";
+                // QA BUG-002 (2026-11-16): say WHY. A session without an interactive desktop (service / scheduled-task window station,
+                // locked or secure desktop, disconnected session) cannot be captured at all; that is reported as such, not as a GDI
+                // fault. Either way it stays a failure: no buffer, no thumbnail, Success = false.
+                var desktop = ProbeDesktop();
+                if (!desktop.Interactive)
+                {
+                    desktopUnavailable = true;
+                    captureError = $"No interactive desktop is available to capture: {desktop.Reason}. Nothing was captured.";
+                }
+                else captureError = "BitBlt failed for both capture modes although an interactive desktop is available (a genuine capture failure).";
+                _logger?.LogWarning("[Observation] Screen capture failed: {Error}", captureError);
             }
 
             captureDurationMs = captureSw.Elapsed.TotalMilliseconds;
@@ -452,7 +483,7 @@ public class Win32ScreenObservationService : IScreenObservationService
             uiaDurationMs = uiaSw.Elapsed.TotalMilliseconds;
         }
 
-        string overallStatus = captureFailed ? "Failed" : uiaStatus == "PartialUiaTimeout" ? "PartialUiaTimeout" : "Captured";
+        string overallStatus = desktopUnavailable ? "DesktopUnavailable" : captureFailed ? "Failed" : uiaStatus == "PartialUiaTimeout" ? "PartialUiaTimeout" : "Captured";
 
         return new CaptureObservationResponse
         {
@@ -463,9 +494,9 @@ public class Win32ScreenObservationService : IScreenObservationService
             Success = !captureFailed,
             Status = overallStatus,
             ErrorMessage = captureError,
-            RejectionCode = captureFailed ? "CaptureFailed" : null,
+            RejectionCode = desktopUnavailable ? "DesktopUnavailable" : captureFailed ? "CaptureFailed" : null,
             CapturedAtUtc = capturedAt,
-            CaptureStatus = captureFailed ? "failed" : "ok",
+            CaptureStatus = desktopUnavailable ? "desktop_unavailable" : captureFailed ? "failed" : "ok",
             UiaStatus = uiaStatus,
             UiaInspectedAtUtc = request.IncludeUiAutomation && targetHwnd != IntPtr.Zero ? DateTimeOffset.UtcNow : null,
             ExpiresAtUtc = capturedAt + ObservationMaxAge,
@@ -493,6 +524,9 @@ public class Win32ScreenObservationService : IScreenObservationService
     /// <summary>The screen blit. A seam so tests can make capture fail; production uses BitBlt and checks its result.</summary>
     protected virtual bool Blit(IntPtr hdcDest, int width, int height, IntPtr hdcSrc, int x, int y, int rop) =>
         BitBlt(hdcDest, 0, 0, width, height, hdcSrc, x, y, rop);
+
+    /// <summary>Whether this process can see an interactive desktop. Asked only after a capture failed. A seam for tests.</summary>
+    protected virtual InteractiveDesktop.State ProbeDesktop() => InteractiveDesktop.Probe();
 
     private (string? SharedMemoryName, long? TargetHandle) CopyToSharedBuffer(
         string observationId, IntPtr pBits, int totalBytes, uint? clientProcessId, string? sessionId)

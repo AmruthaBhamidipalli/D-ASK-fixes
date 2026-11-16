@@ -234,7 +234,7 @@ public class ScreenObservationTests
         }
     }
 
-    [Fact]
+    [InteractiveDesktopFact]   // QA BUG-002: reads the REAL screen; skipped with a reason only when there is no interactive desktop
     public async Task DedicatedTestWindow_FullObservation_Capture_And_UIA_Verification()
     {
         using var bufferMgr = new ObservationBufferManager();
@@ -355,7 +355,7 @@ public class ScreenObservationTests
     // moved to the dedicated, explicitly run tests/DAsk.Benchmarks.ScreenCapture. It was measurement-unstable on a multimodal
     // display-composition distribution and gated unrelated correctness work. The 30 ms target is unchanged THERE and is reported
     // separately; this test keeps the correctness half: every capture succeeds, every buffer is released, and nothing leaks.
-    [Fact]
+    [InteractiveDesktopFact]   // QA BUG-002: reads the REAL screen; skipped with a reason only when there is no interactive desktop
     public async Task RepeatedScreenCapture_ResourceStability_Test()
     {
         using var bufferMgr = new ObservationBufferManager();

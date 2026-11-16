@@ -108,6 +108,17 @@ export class Verifier {
       report.notes.push("Cancelled before the semantic check.");
       return report;
     }
+    // A plan derived entirely from the request (Plan.source "request"): every step's input is the request's own, so a model's opinion
+    // adds nothing. Completion is established only by the deterministic checks (every facet verified by the daemon's observation,
+    // nothing contradicted); otherwise the judgement stays open (null) and the outcome is at most "unverified"/"partial".
+    if (plan.source === "request") {
+      report.method = "evidence+request";
+      if (g.independentlyVerified && contradicted.length === 0 && g.facets.length > 0 && g.facets.every((f) => f.satisfied)) {
+        report.criteriaSatisfied = true;
+        report.notes.push("Every part of the request was performed and confirmed by an independent observation; no model judgement was needed.");
+      }
+      return finish();
+    }
 
     let raw: unknown;
     try {

@@ -15,7 +15,9 @@ import { createOrbScene, type OrbSceneApi, type TelemetryData } from "@/lib/orbS
 import { HandTracker, type TrackerStatus } from "@/lib/handTracker";
 import { soundFx, speechFx, type ThemeColor } from "@/lib/soundEngine";
 import { overlapsOwnSpeech, type SpeechWindow } from "@/lib/spokenText";
-import { PcmRecorder } from "@/lib/pcmRecorder";
+import { downsample, encodeWav, prepareForStt, TARGET_RATE } from "@/lib/pcmRecorder";
+import { VoiceSegmenter } from "@/lib/voiceActivity";
+import { beginMicSession, browserMicEnvironment, classifyMicError, interpretSttResponse, voiceMessage, type MicSession, type SttOutcome, type VoiceIssue } from "@/lib/micSession";
 import { parseVoiceTranscript } from "@/lib/voiceCommand";
 import DevicePanel from "@/components/DevicePanel";
 import ApprovalSurface from "@/components/ApprovalSurface";
@@ -27,7 +29,9 @@ import { requestMode, requestOpenConsole, useHudInteraction } from "@/hooks/hudI
 import type { DeviceInfo } from "@/app/api/devices/route";
 
 type CameraState = "off" | "starting" | "on" | "error";
-type VoiceState = "idle" | "listening" | "unsupported" | "error";
+// listening = armed and waiting for speech; recording = speech in progress; transcribing = whisper is working on an utterance.
+type VoiceState = "idle" | "arming" | "listening" | "recording" | "transcribing" | "unsupported" | "error";
+const VOICE_ARMED: VoiceState[] = ["listening", "recording", "transcribing"];
 
 type VoiceRecognition = {
   continuous: boolean;
@@ -192,9 +196,8 @@ export default function JarvisOrb() {
   const sceneRef = useRef<OrbSceneApi | null>(null);
   const trackerRef = useRef<HandTracker | null>(null);
   const voiceRecognitionRef = useRef<VoiceRecognition | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
   const wakeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const sttFallbackNotedRef = useRef(false);   // the Windows-recognizer fallback is reported once per session
   // Debounce: prevent the same command from firing twice within 5 seconds
   const lastCommandRef = useRef<{ text: string; time: number } | null>(null);
   // TTS echo guard: true while D-ASK is speaking — suppresses mic input
@@ -204,11 +207,13 @@ export default function JarvisOrb() {
   const speechWindowRef = useRef<SpeechWindow | null>(null);
   const segmentStartRef = useRef<number>(0);
 
-  // Groq STT Refs
-  const mediaRecorderRef = useRef<PcmRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const isRecordingRef = useRef(false);
+  // Offline voice input (lib/micSession.ts, lib/voiceActivity.ts, lib/pcmRecorder.ts). One session at a time: armingRef blocks a
+  // second arm while the microphone/AudioContext are still opening; sttQueueRef transcribes utterances one after another.
+  const voiceSessionRef = useRef<MicSession | null>(null);
+  const voiceArmingRef = useRef(false);
+  const voiceGenerationRef = useRef(0);
+  const sttQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const lastLevelRef = useRef(0);
 
   const [camera, setCamera] = useState<CameraState>("off");
   const [status, setStatus] = useState<TrackerStatus>({ hands: 0, mode: "idle" });
@@ -220,6 +225,7 @@ export default function JarvisOrb() {
   useEffect(() => { setNativeShell(isNativeHud()); }, []);
   const [history, setHistory] = useState<CommandEntry[]>([]);
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
+  const [voiceNotice, setVoiceNotice] = useState<string | null>(null);   // the last voice status / problem, always visible
   const [aiThinking, setAiThinking] = useState(false);
   const [wakeActive, setWakeActive] = useState(false);
 
@@ -513,12 +519,9 @@ export default function JarvisOrb() {
       trackerRef.current = null;
       voiceRecognitionRef.current?.stop();
       voiceRecognitionRef.current = null;
-      if (micStreamRef.current) {
-        micStreamRef.current.getTracks().forEach((t) => t.stop());
-      }
-      if (audioContextRef.current) {
-        void audioContextRef.current.close();
-      }
+      voiceGenerationRef.current++;
+      void voiceSessionRef.current?.dispose();
+      voiceSessionRef.current = null;
       scene.dispose();
       sceneRef.current = null;
     };
@@ -935,140 +938,135 @@ export default function JarvisOrb() {
     addHistoryEntry("WAKE WORD DETECTED", "YES BOSS? D-ASK IS ONLINE AND LISTENING...");
   }, [addHistoryEntry]);
 
-  // Offline voice input: 16 kHz WAV -> the native HUD's local recognizer (/api/stt, Windows SAPI). No cloud STT.
-  const toggleVoiceInput = useCallback(async () => {
-    soundFx.playClickSound();
-    if (mediaRecorderRef.current) {
-      if (mediaRecorderRef.current.state !== "inactive") {
-        mediaRecorderRef.current.stop();
-      }
-      mediaRecorderRef.current.stream.getTracks().forEach((t) => t.stop());
-      mediaRecorderRef.current.dispose();
-      mediaRecorderRef.current = null;
-      micStreamRef.current = null;
-      setVoiceState("idle");
-      setAudioLevel(0);
-      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-      // Disarming in the middle of an utterance (the stop above) must not leave "recording" set: with it still true the next arming
-      // never started a recording, so the second voice command after ARM VOICE was never captured. Also release the audio context.
-      isRecordingRef.current = false;
-      void audioContextRef.current?.close().catch(() => undefined);
-      audioContextRef.current = null;
+  // Offline voice input (2026-11-16 physical-microphone remediation). Microphone -> speech-band VAD with an adaptive noise
+  // floor and a 500 ms pre-roll -> quality check + level normalisation -> 16 kHz WAV -> the native HUD's /api/stt (whisper.cpp,
+  // offline; the Windows recognizer only if whisper fails). Every failure is shown (status line + history), never dropped.
+  const reportVoiceIssue = useCallback((issue: VoiceIssue, detail?: string, log = true) => {
+    const msg = voiceMessage(issue, detail);
+    setVoiceNotice(msg);
+    if (log) addHistoryEntry("VOICE INPUT", msg);
+  }, [addHistoryEntry]);
+
+  const disarmVoice = useCallback(() => {
+    voiceGenerationRef.current++;
+    const s = voiceSessionRef.current;
+    voiceSessionRef.current = null;
+    void s?.dispose();
+    setVoiceState("idle");
+    lastLevelRef.current = 0;
+    setAudioLevel(0);
+    sceneRef.current?.setAudioLevel(0);
+  }, []);
+
+  const transcribeUtterance = useCallback(async (wav: Blob, generation: number) => {
+    setCommand("Processing audio...");
+    setVoiceState((v) => (v === "listening" || v === "recording" ? "transcribing" : v));
+    let outcome: SttOutcome;
+    try {
+      // Raw 16-bit PCM WAV to the native HUD's local recognizer; the recording is deleted after transcription.
+      const res = await fetch("/api/stt", { method: "POST", body: wav, headers: { "Content-Type": "audio/wav" } });
+      outcome = interpretSttResponse(res.status, await res.json().catch(() => ({})));
+    } catch (e) {
+      outcome = { kind: "issue", issue: "stt-unreachable", detail: String(e) };
+    }
+    setCommand((c) => (c === "Processing audio..." ? "" : c));
+    if (voiceGenerationRef.current === generation && voiceSessionRef.current) setVoiceState((v) => (v === "transcribing" ? "listening" : v));
+    if (outcome.kind === "issue") {
+      reportVoiceIssue(outcome.issue, outcome.detail);
       return;
     }
+    // QA BUG-003: say when the Windows recognizer answered because whisper could not be used (once per session).
+    if (outcome.engine === "sapi-local" && outcome.fallbackReason && !sttFallbackNotedRef.current) {
+      sttFallbackNotedRef.current = true;
+      addHistoryEntry("VOICE ENGINE", `Using the Windows speech recognizer (offline, less accurate on names) because ${outcome.fallbackReason}.`);
+    }
+    const transcript = outcome.text;
+    setVoiceNotice(`Heard (${outcome.engine}): "${transcript}"`);
+    setCommand(transcript);
+    // A wake word counts only at the START of the utterance (lib/voiceCommand.ts); a request that mentions D-ASK is sent whole.
+    const action = parseVoiceTranscript(transcript);
+    if (isSpeakingRef.current) return;
+    if (action.kind === "wake-only" || (action.kind === "command" && action.viaWakeWord)) {
+      soundFx.playWakeSound();
+      setWakeActive(true);
+      if (wakeTimeoutRef.current) clearTimeout(wakeTimeoutRef.current);
+      wakeTimeoutRef.current = setTimeout(() => setWakeActive(false), 5000);
+    }
+    if (action.kind === "wake-only") {
+      addHistoryEntry("D-ASK WAKE WORD", "YES BOSS? D-ASK IS ONLINE AND LISTENING...");
+    } else if (action.kind === "command") {
+      // The request goes through the normal path: the agent plans it and every protected step still needs approval.
+      voiceCommandRef.current = action.text.toUpperCase();
+      void runCommand(action.text);
+    } else {
+      reportVoiceIssue("no-speech", `too short to be a request: "${transcript}"`);
+    }
+  }, [addHistoryEntry, reportVoiceIssue, runCommand]);
 
+  // MUST stay synchronous up to beginMicSession(): the AudioContext is created and resumed inside this click / key gesture.
+  const toggleVoiceInput = useCallback(() => {
+    if (voiceArmingRef.current) return;                       // still opening: ignore repeated presses (no second session)
+    soundFx.playClickSound();
+    if (voiceSessionRef.current) { disarmVoice(); setVoiceNotice("Voice input off."); return; }
+
+    const generation = ++voiceGenerationRef.current;
+    voiceArmingRef.current = true;
+    setVoiceState("arming");
+    setVoiceNotice("Opening the microphone...");
     // The user is about to speak: D-ASK stops talking (interruption).
     speechFx.stop();
-    isRecordingRef.current = false;
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      micStreamRef.current = stream;
 
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const audioCtx = new AudioCtx();
-      audioContextRef.current = audioCtx;
-      const source = audioCtx.createMediaStreamSource(stream);
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
+    let segmenter: VoiceSegmenter | null = null;
+    const onFrame = (frame: Float32Array) => {
+      if (!segmenter || voiceGenerationRef.current !== generation) return;
+      const r = segmenter.push(frame);
+      // The level ring follows the speech band relative to the room's noise floor (so it moves for quiet microphones too).
+      if (Math.abs(r.level - lastLevelRef.current) > 0.02) {
+        lastLevelRef.current = r.level;
+        setAudioLevel(r.level);
+        sceneRef.current?.setAudioLevel(r.level);
+      }
+      const ev = r.event;
+      if (!ev) return;
+      if (ev.type === "start") {
+        // The segment begins at the start of the pre-roll; the own-voice check uses that time.
+        segmentStartRef.current = Date.now() - segmenter.opts.preRollMs;
+        setVoiceState("recording");
+        setVoiceNotice("Recording...");
+        return;
+      }
+      setVoiceState((v) => (v === "recording" ? "listening" : v));
+      if (ev.type === "discard") { setVoiceNotice("Listening (ignored a short noise)."); return; }
+      // Audio recorded while D-ASK was speaking (plus a grace period) is its own voice: never transcribed, never run as a command.
+      if (overlapsOwnSpeech(segmentStartRef.current, Date.now(), speechWindowRef.current)) { reportVoiceIssue("own-voice", undefined, false); return; }
+      const prepared = prepareForStt(downsample(ev.samples, ev.sampleRate), TARGET_RATE);
+      const s = prepared.stats;
+      const levels = `speech ${s.speechDb.toFixed(0)} dBFS, noise ${s.noiseDb.toFixed(0)} dBFS, SNR ${s.snrDb.toFixed(0)} dB, ${Math.round(s.activeMs)} ms voiced`;
+      if (!prepared.ok) { reportVoiceIssue(prepared.reason, levels); return; }
+      console.info(`[VOICE] utterance ${Math.round(s.durationMs)} ms, ${levels}, gain +${prepared.gainDb.toFixed(1)} dB${prepared.limited ? " (limited)" : ""}`);
+      const wav = new Blob([encodeWav(prepared.samples, TARGET_RATE)], { type: "audio/wav" });
+      sttQueueRef.current = sttQueueRef.current.then(() => transcribeUtterance(wav, generation)).catch(() => undefined);
+    };
 
-      const mediaRecorder = new PcmRecorder(stream, audioCtx, source);
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
-
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunksRef.current.push(e.data);
-      };
-
-      mediaRecorder.onstop = async () => {
-        if (audioChunksRef.current.length === 0) return;
-        const blob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-        audioChunksRef.current = [];
-
-        // Audio recorded while D-ASK was speaking (plus a grace period) is its own voice: never transcribed, never run as a command.
-        if (overlapsOwnSpeech(segmentStartRef.current, Date.now(), speechWindowRef.current)) { setCommand(""); return; }
-
-        // Skip tiny blips
-        if (blob.size < 3000) return;
-
-        setCommand("Processing audio...");
-        try {
-          // Raw 16-bit PCM WAV to the native HUD's local recognizer; the recording is deleted after transcription.
-          const res = await fetch('/api/stt', { method: 'POST', body: blob, headers: { 'Content-Type': 'audio/wav' } });
-          if (res.ok) {
-            const data = await res.json();
-            const transcript = data.text?.trim();
-            if (transcript) {
-              setCommand(transcript);
-              // A wake word counts only at the START of the utterance (lib/voiceCommand.ts); a request that mentions D-ASK is sent whole.
-              const action = parseVoiceTranscript(transcript);
-              if (!isSpeakingRef.current) {
-                if (action.kind === "wake-only" || (action.kind === "command" && action.viaWakeWord)) {
-                  soundFx.playWakeSound();
-                  setWakeActive(true);
-                  if (wakeTimeoutRef.current) clearTimeout(wakeTimeoutRef.current);
-                  wakeTimeoutRef.current = setTimeout(() => setWakeActive(false), 5000);
-                }
-                if (action.kind === "wake-only") {
-                  addHistoryEntry("D-ASK WAKE WORD", "YES BOSS? D-ASK IS ONLINE AND LISTENING...");
-                } else if (action.kind === "command") {
-                  voiceCommandRef.current = action.text.toUpperCase();
-                  void runCommand(action.text);
-                }
-              }
-            } else {
-              setCommand("");
-            }
-          } else {
-            setCommand("ERROR: STT Failed");
-          }
-        } catch (e) {
-          console.error("STT Error", e);
-        }
-      };
-
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
-      const checkVolume = () => {
-        if (!micStreamRef.current) return;
-        analyser.getByteFrequencyData(dataArray);
-        let sum = 0;
-        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-        const avg = sum / dataArray.length;
-        const normalized = Math.min(1, avg / 128);
-        setAudioLevel(normalized);
-        sceneRef.current?.setAudioLevel(normalized);
-
-        if (normalized > 0.05) {
-          if (!isRecordingRef.current) {
-            isRecordingRef.current = true;
-            if (mediaRecorderRef.current?.state === "inactive") {
-              segmentStartRef.current = Date.now();
-              mediaRecorderRef.current.start();
-            }
-          }
-          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-          silenceTimerRef.current = setTimeout(() => {
-            isRecordingRef.current = false;
-            if (mediaRecorderRef.current?.state === "recording") {
-              mediaRecorderRef.current.stop();
-            }
-          }, 1500);
-        }
-
-        requestAnimationFrame(checkVolume);
-      };
-      checkVolume();
-
+    beginMicSession(browserMicEnvironment(), onFrame, {
+      onIssue: (issue) => { if (voiceGenerationRef.current !== generation) return; reportVoiceIssue(issue); if (issue === "mic-lost") disarmVoice(); },
+    }).then((session) => {
+      voiceArmingRef.current = false;
+      if (voiceGenerationRef.current !== generation) { void session.dispose(); return; }   // unmounted / disarmed meanwhile
+      segmenter = new VoiceSegmenter(session.sampleRate);
+      voiceSessionRef.current = session;
       setVoiceState("listening");
+      setVoiceNotice(`Listening${session.deviceLabel ? ` on ${session.deviceLabel}` : ""}. Speak normally.`);
       soundFx.playWakeSound();
-
-    } catch (err) {
-      console.error(err);
-      setVoiceState("error");
-      addHistoryEntry("VOICE INPUT", "MICROPHONE PERMISSION DENIED · ALLOW MIC ACCESS");
-      return;
-    }
-  }, [addHistoryEntry, runCommand]);
+    }, (err) => {
+      voiceArmingRef.current = false;
+      if (voiceGenerationRef.current !== generation) return;
+      console.error("[VOICE] could not start", err);
+      const issue = classifyMicError(err);
+      setVoiceState(issue === "unsupported" || issue === "audio-context-unavailable" ? "unsupported" : "error");
+      reportVoiceIssue(issue);
+    });
+  }, [disarmVoice, reportVoiceIssue, transcribeUtterance]);
 
   // Keyboard controls
   useEffect(() => {
@@ -1097,7 +1095,7 @@ export default function JarvisOrb() {
           break;
         case "v":
         case "V":
-          void toggleVoiceInput();
+          toggleVoiceInput();   // synchronous: the AudioContext starts inside this key gesture
           break;
         case "m":
         case "M":
@@ -1286,20 +1284,20 @@ export default function JarvisOrb() {
           <div className="console-statuses">
             {aiThinking && <span className="ai-state">THINKING</span>}
             <span className="voice-state" data-state={voiceState}>
-              {voiceState === "listening" ? "ARMED" : voiceState === "unsupported" ? "VOICE N/A" : voiceState === "error" ? "ERROR" : "VOICE"}
+              {({ idle: "VOICE", arming: "OPENING MIC", listening: "LISTENING", recording: "RECORDING", transcribing: "TRANSCRIBING", unsupported: "VOICE N/A", error: "VOICE ERROR" } as Record<VoiceState, string>)[voiceState]}
             </span>
             <span className="console-indicator">ONLINE</span>
           </div>
         </div>
 
-        {/* Dynamic 8-Bar Audio Spectrum Equalizer */}
-        <div className="audio-equalizer" data-active={voiceState === "listening" || audioLevel > 0}>
+        {/* Dynamic 8-Bar Audio Spectrum Equalizer: the REAL speech-band level while armed (no placeholder height, so a dead microphone is visible). */}
+        <div className="audio-equalizer" data-active={VOICE_ARMED.includes(voiceState) || audioLevel > 0}>
           {[0.6, 0.9, 0.4, 1.0, 0.7, 0.5, 0.85, 0.3].map((heightMult, i) => (
             <div
               key={i}
               className="eq-bar"
               style={{
-                height: `${Math.max(15, Math.round((audioLevel || (voiceState === "listening" ? 0.4 : 0.15)) * heightMult * 100))}%`,
+                height: `${Math.max(15, Math.round(Math.max(audioLevel, VOICE_ARMED.includes(voiceState) ? 0.05 : 0.15) * heightMult * 100))}%`,
               }}
             />
           ))}
@@ -1325,6 +1323,9 @@ export default function JarvisOrb() {
           />
           <button type="submit" className="command-submit" aria-label="Run command">RUN</button>
         </form>
+        {voiceNotice ? (
+          <div id="voice-notice" className="voice-notice" role="status" aria-live="polite" data-state={voiceState}>{voiceNotice}</div>
+        ) : null}
 
         <div className="command-shortcuts" aria-label="Command shortcuts">
           {(nativeShell
@@ -1341,11 +1342,12 @@ export default function JarvisOrb() {
           <button
             type="button"
             className="voice-button"
-            data-listening={voiceState === "listening"}
-            onClick={() => void toggleVoiceInput()}
-            aria-pressed={voiceState === "listening"}
+            data-listening={VOICE_ARMED.includes(voiceState)}
+            onClick={() => toggleVoiceInput()}
+            aria-pressed={VOICE_ARMED.includes(voiceState)}
+            disabled={voiceState === "arming"}
           >
-            {voiceState === "listening" ? "ARMED (V)" : "ARM VOICE (V)"}
+            {VOICE_ARMED.includes(voiceState) ? "ARMED (V)" : voiceState === "arming" ? "OPENING MIC..." : "ARM VOICE (V)"}
           </button>
           <button
             type="button"

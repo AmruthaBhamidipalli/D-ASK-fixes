@@ -34,6 +34,9 @@ class Scripted implements LanguageModel {
 const GRANTS = new Set<ToolPermission>([...DEFAULT_GRANTS, "read:desktop", "request:desktop_action"]);
 const run = (bridge: DesktopBridge, model: LanguageModel, objective: string) =>
   new AgentRuntime({ model, registry: createDefaultRegistry(ROOT, { desktop: bridge }), granted: GRANTS }).run({ taskId: `t${Math.random()}`.replace(".", ""), objective });
+/** The model is asked to plan (request-derived plans off): tests that a MODEL's different values never reach the daemon. */
+const runModel = (bridge: DesktopBridge, model: LanguageModel, objective: string) =>
+  new AgentRuntime({ model, registry: createDefaultRegistry(ROOT, { desktop: bridge }), granted: GRANTS, requestPlans: false }).run({ taskId: `t${Math.random()}`.replace(".", ""), objective });
 
 async function main() {
   console.log("\n[G] Grammar");
@@ -80,7 +83,7 @@ async function main() {
     const r = await run(d, new Scripted([plan([{ id: "s1", tool: "android.push", input: { file: f } }])]), `Copy ${f} to my phone`);
     check(r.outcome === "completed" && d.calls.length === 1 && (d.calls[0]!.args as any).file === f && /SHA-256/.test(r.response), "E2 push: exactly the named file; completed only when verified", { o: r.outcome, r: r.response });
     const d2 = new FakeDaemon([{ status: "ok", result: { verified: true } } as any]);
-    const r2 = await run(d2, new Scripted([plan([{ id: "s1", tool: "android.push", input: { file: "C:\\Windows\\System32\\config\\SAM" } }])]), `Copy ${f} to my phone`);
+    const r2 = await runModel(d2, new Scripted([plan([{ id: "s1", tool: "android.push", input: { file: "C:\\Windows\\System32\\config\\SAM" } }])]), `Copy ${f} to my phone`);
     check(r2.outcome !== "completed" && d2.calls.length === 0, "E3 a different file planned by the model never reaches the daemon");
   }
   {
@@ -90,7 +93,7 @@ async function main() {
   }
   {
     const d = new FakeDaemon([{ status: "ok", result: { verified: true } } as any]);
-    const r = await run(d, new Scripted([plan([{ id: "s1", tool: "android.command", input: { action: "lock" } }])]), "Go home on my phone");
+    const r = await runModel(d, new Scripted([plan([{ id: "s1", tool: "android.command", input: { action: "lock" } }])]), "Go home on my phone");
     check(r.outcome !== "completed" && d.calls.length === 0, "E5 a different command planned by the model never reaches the daemon");
   }
   console.log(`\n${passed} passed, ${failed} failed`);

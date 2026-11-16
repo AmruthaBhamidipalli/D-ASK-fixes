@@ -23,7 +23,7 @@ try {
     while (-not ((Get-Content $hudLog -Raw -ErrorAction SilentlyContinue) -match 'Handshake accepted') -and $sw.Elapsed.TotalSeconds -lt 30) { Start-Sleep -Milliseconds 200 }
     Enter-HudInteractive $hwnd
     Write-Host "READY: click the microphone button in the HUD and speak. Waiting for $Count utterance(s), up to $TimeoutSec s." -ForegroundColor Green
-    $seen = 0; $lastValue = ''
+    $seen = 0; $lastValue = ''; $lastNotice = ''
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     $cmd = $null
     $nonEmpty = 0
@@ -32,6 +32,13 @@ try {
         $value = ''
         try { if ($cmd) { $value = ($cmd.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)).Current.Value } } catch { $cmd = $null }
         if ($value -and $value -ne $lastValue -and $value -ne 'Processing audio...') { $lastValue = $value; $records += [pscustomobject]@{ utc = (Get-Date).ToUniversalTime().ToString('o'); kind = 'commandBox'; text = $value } }
+        # The HUD's voice status line (2026-11-16): listening / recording / every rejection or recognizer problem, with levels.
+        try {
+            $n = Find-HudElement $hwnd -AutomationId 'voice-notice' -TimeoutMs 0
+            $nt = $n.Current.Name
+            if (-not $nt) { $tw = [System.Windows.Automation.TreeWalker]::RawViewWalker; $c = $tw.GetFirstChild($n); while ($c) { $nt += $c.Current.Name; $c = $tw.GetNextSibling($c) } }
+            if ($nt -and $nt -ne $lastNotice) { $lastNotice = $nt; $records += [pscustomobject]@{ utc = (Get-Date).ToUniversalTime().ToString('o'); kind = 'voiceNotice'; text = $nt }; Write-Host "  voice: $nt" -ForegroundColor DarkCyan }
+        } catch { }
         $lines = @(Select-String -Path $hudLog -Pattern '\[STT\] Transcribed (\d+) bytes of audio \((\d+) characters\) with (\S+) in (\d+) ms' -ErrorAction SilentlyContinue)
         while ($seen -lt $lines.Count) {
             $m = $lines[$seen].Matches[0]

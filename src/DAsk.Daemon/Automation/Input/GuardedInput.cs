@@ -260,6 +260,22 @@ public static class TextRules
         return false;
     }
 
+    /// <summary>
+    /// Like <see cref="IsExactInsertion"/>, but allowing what a word processor's AutoCorrect does while typing: letter case (e.g. the
+    /// first letter of a sentence capitalised) and straight quotes/dashes turned typographic. Everything else must match exactly, and the
+    /// caller reports that the application changed the text (never as an exact match).
+    /// </summary>
+    public static bool IsInsertionAllowingAutoCorrect(string before, string after, string text) =>
+        IsExactInsertion(Fold(before), Fold(after), Fold(text));
+
+    private static string Fold(string s)
+    {
+        var sb = new StringBuilder(s.Length);
+        foreach (char c in s)
+            sb.Append(c switch { '‘' or '’' or '‛' or '′' => '\'', '“' or '”' or '‟' or '″' => '"', '–' or '—' => '-', ' ' => ' ', _ => char.ToLowerInvariant(c) });
+        return sb.ToString();
+    }
+
     public static string Sha256(string s) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(s)));
 }
 

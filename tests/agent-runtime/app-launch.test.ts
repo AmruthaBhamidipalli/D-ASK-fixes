@@ -53,8 +53,8 @@ const launchStep = (id = "s1") => ({ id, description: "open Notepad", tool: "des
 const typeStep = (text: string, id = "s2") => ({ id, description: "type the text", tool: "desktop.type_text", input: { process: "notepad.exe", controlType: "Document", control: "Text editor", text } });
 const plan = (steps: unknown[]) => ({ intent: "task", goal: "open notepad and type", successCriteria: ["Notepad is open and contains the text"], steps });
 let n = 0;
-const runWith = async (objective: string, model: Model, daemon: AppDaemon) => {
-  const rt = new AgentRuntime({ model, registry: createDefaultRegistry(ROOT, { desktop: daemon }), granted: GRANTED });
+const runWith = async (objective: string, model: Model, daemon: AppDaemon, requestPlans = true) => {
+  const rt = new AgentRuntime({ model, registry: createDefaultRegistry(ROOT, { desktop: daemon }), granted: GRANTED, requestPlans });
   return rt.run({ taskId: `t${++n}`, objective });
 };
 const REQ = "Open Notepad and type HELLO";
@@ -128,7 +128,7 @@ async function main() {
   }
   {
     const d = new AppDaemon();
-    const r = await runWith(REQ, new Model([plan([launchStep(), typeStep("hello")])]), d);
+    const r = await runWith(REQ, new Model([plan([launchStep(), typeStep("hello")])]), d, false);
     check(r.outcome !== "completed" && d.calls.every((c) => c.tool !== "desktop.type_text" || c.args.text === "HELLO"), "D5 text other than the request's never reaches the daemon", { o: r.outcome, c: d.calls });
   }
   {

@@ -351,6 +351,8 @@ public class Phase7B1bTests
         public int Calls;
         public BlitService(ObservationBufferManager b, IUiAutomationService u, bool ok) : base(b, u) => _ok = ok;
         protected override bool Blit(IntPtr hdcDest, int width, int height, IntPtr hdcSrc, int x, int y, int rop) { Calls++; return _ok; }
+        // This test is about a GENUINE capture failure on an interactive desktop (the headless case: ScreenCaptureHeadlessTests).
+        protected override InteractiveDesktop.State ProbeDesktop() => new(true, null);
     }
 
     [Fact]

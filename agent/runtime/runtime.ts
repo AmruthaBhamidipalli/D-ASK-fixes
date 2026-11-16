@@ -13,7 +13,7 @@ import { Brain } from "./brain";
 import { Planner } from "./planner";
 import { DENY_ALL_APPROVALS, ToolRegistry, errMessage } from "./toolRegistry";
 import { Verifier, decideOutcome, evidenceLines, judgeStep } from "./verifier";
-import { checkArguments, clarificationFor, detectFacets, type ArgumentDomains } from "./grounding";
+import { checkArguments, claimingTools, clarificationFor, detectFacets, unexplainedWords, type ArgumentDomains } from "./grounding";
 import { assessCapability } from "./capabilityCheck";
 import { acceptAnswer, classifyConversation } from "./conversation";
 import {
@@ -24,6 +24,7 @@ import {
   type LanguageModel,
   type Plan,
   type PlanningMemorySource,
+  type RequestFacet,
   type RunOutcome,
   type RunReport,
   type RuntimeEvent,
@@ -64,6 +65,12 @@ export interface RuntimeConfig {
    * Off unless the host enables it: it never applies to anything a tool, an action or a permission is involved in.
    */
   conversation?: boolean;
+  /**
+   * Plan a request that a tool claims as a whole, and whose every step that tool derives exactly, from the request itself instead of
+   * asking the model (default ON, 2026-11-16: faster, and independent of the local model's memory and output quality). false: always ask
+   * the model (tests of model-plan validation use it).
+   */
+  requestPlans?: boolean;
   experimental?: {
     /** Planner rejects plans with "contradicted" steps and spends its repair round on them. */
     planGrounding?: boolean;
@@ -177,7 +184,10 @@ export class AgentRuntime {
           accepted = acceptAnswer(await this.brain.answerQuestion(opts.objective, run.signal));
         } catch (err) {
           if (run.signal.aborted) throw err;
-          accepted = { ok: false, error: `I couldn't reach the local model to answer that (${errMessage(err)}).` };
+          const why = errMessage(err);
+          accepted = { ok: false, error: /Insufficient physical memory/i.test(why)
+            ? `I can't answer that right now: the local AI model needs more free memory than this computer has at the moment (${why}). Closing some programs frees memory; desktop requests such as "open Word and type hello" still work without the model.`
+            : `I couldn't reach the local model to answer that (${why}).` };
         }
         conversation = accepted.ok ? { outcome: "answered", response: accepted.text } : { outcome: "failed", response: accepted.error };
       }
@@ -196,7 +206,12 @@ export class AgentRuntime {
         // An explicit ordered request whose remaining steps are fully determined by the request continues deterministically
         // (no model re-plan): the small local model was observed to omit or repeat them. Validated like any plan.
         const continuation = iteration > 1 && verification ? this.orderedContinuation(opts.objective, steps, verification) : null;
-        const planned = continuation
+        // First round: a request that a tool claims as a whole, and whose every part that tool turns into an exact step, is planned
+        // from the request itself (no model call). Same validation as any plan; when anything is missing, the model plans as before.
+        const direct = iteration === 1 && this.config.requestPlans !== false ? this.requestPlan(opts.objective) : null;
+        const planned = direct
+          ? { ok: true as const, plan: direct, attempts: 0 }
+          : continuation
           ? (() => {
               const c = this.planner.check(continuation, { maxSteps: this.limits.maxStepsPerPlan, granted: this.config.granted, idPrefix: `r${iteration}_`, performed, objective: opts.objective });
               return c.ok ? { ok: true as const, plan: c.plan, attempts: 0 } : { ok: false as const, error: c.errors.join("; "), attempts: 0 };
@@ -219,6 +234,11 @@ export class AgentRuntime {
           if (run.signal.aborted) break;
           // First round: nothing ran. Later rounds: keep what earlier rounds achieved.
           error = iteration === 1 ? `Planning failed: ${planned.error}` : `Follow-up planning failed: ${planned.error}`;
+          // Graceful degradation (2026-11-16): the memory guard is never lowered; say what that means and what still works without the model.
+          if (/Insufficient physical memory/i.test(planned.error))
+            error += ". The local AI model needs more free memory than this computer has right now (closing some programs frees it). "
+              + "Requests D-ASK understands directly still work without the model, for example \"open Word and type hello\", \"open display settings\", "
+              + "\"what windows are open?\" or \"open Chrome and search for news\".";
           break;
         }
 
@@ -297,6 +317,38 @@ export class AgentRuntime {
     await this.config.registry.endTask(opts.taskId);
     emit({ type: "finished", report });
     return report;
+  }
+
+  /**
+   * A plan derived entirely from the request, or null. Only when the detected facets cover the WHOLE request (a tool claims it, e.g.
+   * "open Word and type hello", and every facet belongs to a claiming tool; or no word of the request is left unexplained) and each
+   * facet's tool derives the step's exact input from the request (ToolRequestCheck.stepFor). Steps follow the request's order (sequence index). The result is
+   * validated by the planner exactly like a model's proposal (arrangement, schema, argument domains, permissions).
+   */
+  private requestPlan(objective: string): Plan | null {
+    let claimed: Set<string>;
+    let facets: RequestFacet[];
+    try { claimed = claimingTools(this.config.registry, objective); facets = detectFacets(this.config.registry, objective); } catch { return null; }
+    if (facets.length === 0) return null;
+    // Either a tool claims the whole request, or every word of the request is accounted for by the detected parts (the same rule the
+    // verifier uses for independent verification): only then can nothing the request asks for be left out of a request-derived plan.
+    if (claimed.size > 0 ? facets.some((f) => !claimed.has(f.tool)) : unexplainedWords(this.config.registry, objective, facets).length > 0) return null;
+    const ordered = facets.map((f, i) => ({ f, i })).sort((a, b) => (a.f.sequence?.index ?? a.i) - (b.f.sequence?.index ?? b.i)).map((x) => x.f);
+    const out: { id: string; tool: string; description: string; input: Record<string, unknown> }[] = [];
+    const seen = new Set<string>();
+    for (const f of ordered) {
+      let input: Record<string, unknown> | null = null;
+      try { input = this.config.registry.get(f.tool)?.requestCheck?.stepFor?.(f, objective) ?? null; } catch { input = null; }
+      if (!input) return null;
+      const key = f.tool + "\u0000" + JSON.stringify(input);
+      if (seen.has(key) && !f.sequence) continue;
+      seen.add(key);
+      out.push({ id: `s${out.length + 1}`, tool: f.tool, description: f.description, input });
+    }
+    if (out.length === 0) return null;
+    const c = this.planner.check({ intent: "task", goal: objective.slice(0, 300), successCriteria: [], steps: out },
+      { maxSteps: this.limits.maxStepsPerPlan, granted: this.config.granted, objective });
+    return c.ok ? { ...c.plan, source: "request" } : null;
   }
 
   /**

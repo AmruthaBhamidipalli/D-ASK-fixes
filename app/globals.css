@@ -756,9 +756,29 @@ body {
   color: rgba(255, 255, 255, 0.45);
 }
 
-.voice-state[data-state="listening"] {
+.voice-state[data-state="listening"],
+.voice-state[data-state="arming"],
+.voice-state[data-state="transcribing"] {
   color: var(--hud-text-bright);
   animation: voice-pulse 1s ease-in-out infinite;
+}
+
+.voice-state[data-state="recording"] {
+  color: #ffb340;
+  animation: voice-pulse 0.5s ease-in-out infinite;
+}
+
+.voice-notice {
+  margin: 4px 0 2px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.72);
+  overflow-wrap: anywhere;
+}
+
+.voice-notice[data-state="error"],
+.voice-notice[data-state="unsupported"] {
+  color: #ff5533;
 }
 
 .voice-state[data-state="error"],

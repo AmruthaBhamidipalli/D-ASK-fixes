@@ -1,48 +1,28 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth } from '../../../lib/security/apiAuth';
-import { inferenceMode } from '../../../agent/runtime/inference/policy';
 
+// Speech-to-text is OFFLINE ONLY and is served by the native HUD (src/hud-native: dask://localhost/api/stt -> whisper.cpp,
+// with the Windows recognizer as the local fallback). This Next.js route exists only so a browser/dev build answers clearly
+// instead of 404. It never forwards audio anywhere: the former hosted (Groq) path was removed on 2026-11-16 because it was a
+// dead end in offline-first mode and suggested a cloud recognizer that D-ASK must not depend on.
 export async function POST(req: NextRequest) {
   const denied = requireAuth(req, 'task');
   if (denied) return denied;
   try {
-    const formData = await req.formData();
-    const file = formData.get('file') as Blob | null;
-
+    const formData = await req.formData().catch(() => null);
+    const file = formData?.get('file') as Blob | null | undefined;
     if (!file) {
       return NextResponse.json({ error: 'No audio file provided' }, { status: 400 });
     }
-
-    // Hosted STT (Groq Whisper) is refused in offline-first mode; no local STT exists yet.
-    if (inferenceMode() !== 'cloud') {
-      return NextResponse.json(
-        { error: 'Speech-to-text is unavailable offline: no local STT engine is installed, and cloud STT is disabled (DASK_INFERENCE=local).', unavailable: 'cloud-inference-disabled' },
-        { status: 503 }
-      );
-    }
-
-    const groqFormData = new FormData();
-    groqFormData.append('file', file, 'audio.webm');
-    groqFormData.append('model', 'whisper-large-v3');
-
-    const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
+    return NextResponse.json(
+      {
+        error: 'Speech-to-text runs only in the native D-ASK HUD (offline whisper.cpp). This development server does not transcribe audio and never sends it to a cloud service.',
+        reason: 'native HUD required for offline speech recognition',
+        unavailable: 'native-hud-required',
       },
-      body: groqFormData as unknown as BodyInit,
-    });
-
-    if (!res.ok) {
-      const errText = await res.text();
-      console.error('Groq STT error:', errText);
-      return NextResponse.json({ error: `Groq error: ${res.statusText}` }, { status: res.status });
-    }
-
-    const data = await res.json() as { text: string };
-    return NextResponse.json({ text: data.text });
-  } catch (error: any) {
-    console.error('STT endpoint error:', error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+      { status: 503 }
+    );
+  } catch (error: unknown) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
   }
 }

@@ -1073,3 +1073,15 @@ Full statuses: `docs/product-completion/RELEASE-READINESS-REPORT.md` section 0. 
 - **Signing**: `scripts/package/Sign-D-ASK.ps1` (Inventory/Sign/Verify; refuses self-signed/private roots), `build-package.mjs --sign-thumbprint|--sign-pfx|--sign-dlib`, `tests/package/sign-policy.ps1` 7/7. BLOCKED: no trusted certificate; D-ASK is not signed.
 - **Regression**: daemon 678/0/7 skipped; TS 2,276 checks (2 load-only failures pass alone); Rust 71/0/4 ignored.
 - **Left for the user**: install adb + authorize a phone; obtain a trusted code-signing certificate; human-in-the-loop session; re-run the installed console check with ≥3.5 GB RAM free.
+
+
+## Remediation (2026-11-16 ~14:30-16:00): Word typing, model-free planning, HUD catalog cards, honest web-search errors
+
+Full report: `docs/product-completion/REMEDIATION-2026-11-16.md`. Installed `dist/desktop/D-ASK-20261116T151233`. Evidence `results/remediation-20261116/`. Nothing committed.
+Real HUD (harness-approved): Word approve 9/9, Word decline 9/9, Chrome search 5/5, installed Word 9/9; STT engines 6/6. Daemon 669/0; all TS suites pass.
+
+
+## QA remediation (2026-11-16 ~20:00-21:15): BUG-001 security suite, BUG-002 headless capture, BUG-003 speech engine disclosure
+
+Report: `docs/product-completion/REMEDIATION-QA-2026-11-16.md`. Package `dist/desktop/D-ASK-20261116T210103` (not installed). Evidence `results/remediation-qa-20261116/`. Nothing committed.
+security 220/0; .NET 701/0/8 skipped; TS 43/43 suites; Rust 74/0/4 ignored; headless window-station run 19 passed/2 skipped/0 failed; real HUD Word 9/9 + 9/9, Chrome 5/5.

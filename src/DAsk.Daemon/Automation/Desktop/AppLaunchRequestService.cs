@@ -69,6 +69,8 @@ public sealed class AppLaunchOptions
     /// local folder/file, is unaffected.
     /// </summary>
     public bool WebSearchAllowed { get; init; }
+    /// <summary>Tests only: whether Windows reports a network connection. Null: NetworkInterface.GetIsNetworkAvailable().</summary>
+    public Func<bool>? IsOnline { get; init; }
 }
 
 public sealed record LaunchedWindow(long Hwnd, int ProcessId, long ProcessCreationFileTime, string ImageName);
@@ -146,7 +148,7 @@ public sealed class AppLaunchRequestService : IDesktopActionRequestService
         if (args.ValueKind != JsonValueKind.Object) return "arguments must be an object";
         foreach (var p in args.EnumerateObject())
         {
-            if (p.Name is "search" or "folder") continue;   // ParseTarget validates these
+            if (p.Name is "search" or "folder" or "newDocument") continue;   // ParseTarget validates these
             if (p.Name != "app") return $"unknown argument '{(p.Name.Length > 40 ? p.Name[..40] : p.Name)}'";   // never a path, arguments, a verb or a command line
             if (p.Value.ValueKind != JsonValueKind.String) return "app must be text";
             name = p.Value.GetString();
@@ -165,6 +167,11 @@ public sealed class AppLaunchRequestService : IDesktopActionRequestService
 
     private static readonly string[] Browsers = { "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe" };
     private static readonly string[] FolderApps = { "Code.exe", "explorer.exe" };
+    /// <summary>The fixed switch each application documents for starting with a new blank document. Never agent text.</summary>
+    private static readonly IReadOnlyDictionary<string, string> BlankDocumentSwitch = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["WINWORD.EXE"] = "/w",
+    };
 
     /// <summary>Pure: at most one of { "search": "&lt;words&gt;" } or { "folder": "&lt;existing folder&gt;" }; null when neither is given.</summary>
     public static string? ParseTarget(JsonElement args, out OpenTarget? target)
@@ -173,8 +180,15 @@ public sealed class AppLaunchRequestService : IDesktopActionRequestService
         if (args.ValueKind != JsonValueKind.Object) return null;
         foreach (var p in args.EnumerateObject())
         {
+            if (p.Name == "newDocument")
+            {
+                if (p.Value.ValueKind != JsonValueKind.True) return "newDocument must be true when given";
+                if (target != null) return "give only one of a search, a folder or a new document";
+                target = new OpenTarget("new", "");
+                continue;
+            }
             if (p.Name is not ("search" or "folder")) continue;
-            if (target != null) return "give either a search or a folder, not both";
+            if (target != null) return "give only one of a search, a folder or a new document";
             if (p.Value.ValueKind != JsonValueKind.String) return $"{p.Name} must be text";
             string v = p.Value.GetString()!.Trim();
             if (v.Length is 0 or > 200 || v.Any(char.IsControl) || v.Contains('"')) return $"{p.Name} must be 1-200 characters of plain text";
@@ -196,6 +210,14 @@ public sealed class AppLaunchRequestService : IDesktopActionRequestService
     /// </summary>
     public static (string? Argument, string? Opens, string? Problem) TargetArgument(InstalledApp app, OpenTarget t)
     {
+        if (t.Kind == "new")
+        {
+            // Ready for typing: the application's own documented switch for a new blank document, where it has one (observed 2026-11-16:
+            // "WINWORD.EXE /w" opens "Document1 - Word" with its focused editor instead of the Start screen). Others open as usual.
+            if (app.ExeName != null && BlankDocumentSwitch.TryGetValue(app.ExeName, out var sw)) return (sw, "a new blank document", null);
+            if (app.ExeName != null && Browsers.Contains(app.ExeName, StringComparer.OrdinalIgnoreCase)) return (null, null, $"{app.Name} is a web browser; D-ASK does not type into a browser this way");
+            return (null, "the application's own start window (ready for typing where it opens an empty document)", null);
+        }
         if (t.Kind == "search")
         {
             if (app.ExeName == null || !Browsers.Contains(app.ExeName, StringComparer.OrdinalIgnoreCase)) return (null, null, $"{app.Name} is not a web browser D-ASK can search with");
@@ -208,7 +230,7 @@ public sealed class AppLaunchRequestService : IDesktopActionRequestService
 
     /// <summary>Whether a window shows the target: a search's words, or the folder's name, in its title.</summary>
     public static bool ShowsTarget(OpenTarget t, WindowIdentity w) =>
-        w.Title.Contains(t.Kind == "search" ? t.Value : Path.GetFileName(t.Value), StringComparison.OrdinalIgnoreCase);
+        t.Kind == "new" || w.Title.Contains(t.Kind == "search" ? t.Value : Path.GetFileName(t.Value), StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Pure: { "app": "&lt;known application&gt;" } from the fixed list (used when no catalog of installed applications is configured).</summary>
     public static string? Parse(JsonElement args, out KnownApp? app)
@@ -245,9 +267,14 @@ public sealed class AppLaunchRequestService : IDesktopActionRequestService
         if (ParseName(args, out var name) is { } badName) return DesktopCallResult.Fail("invalid_args", badName);
         if (ParseTarget(args, out var target) is { } badTarget) return DesktopCallResult.Fail("invalid_args", badTarget);
         if (target != null && _opts.Catalog == null) return DesktopCallResult.Fail("invalid_args", "opening a search or a folder needs the catalog of installed applications");
+        // Two different reasons, never conflated (2026-11-16): D-ASK's own offline-first SETTING, and the computer's actual network state.
         if (target?.Kind == "search" && !_opts.WebSearchAllowed)
-            return DesktopCallResult.Fail("offline_mode",
-                $"A web search needs internet access, and D-ASK is in offline mode (web searches are switched off: AgentHost:WebSearch). Nothing was opened or searched. You can still ask D-ASK to open {name} itself, or a local file or folder.");
+            return DesktopCallResult.Fail("web_search_disabled",
+                $"Web search is switched off in D-ASK's settings (offline-first: AgentHost:WebSearch is off), so nothing was opened or searched. This is a D-ASK setting, not a problem with your internet connection. " +
+                $"To allow web searches, add the line \"set DASK_AgentHost__WebSearch=true\" to %LOCALAPPDATA%\\D-ASK\\features.cmd and restart D-ASK. You can still ask me to open {name} by itself.");
+        if (target?.Kind == "search" && !(_opts.IsOnline?.Invoke() ?? System.Net.NetworkInformation.NetworkInterface.GetIsNetworkAvailable()))
+            return DesktopCallResult.Fail("no_network",
+                $"Web search is allowed, but Windows reports no network connection right now, so nothing was opened or searched. Connect to a network and ask again; I can still open {name} by itself.");
         // Any installed application (when the catalog is configured); the fixed list keeps its own, observed path.
         if ((KnownApps.Find(name) == null || target != null) && _opts.Catalog != null) return await RunCatalogAsync(name!, target, ctx, ct);
         if (Parse(args, out var app) is { } bad) return DesktopCallResult.Fail("invalid_args", bad);
@@ -396,7 +423,7 @@ public sealed class AppLaunchRequestService : IDesktopActionRequestService
         {
             var (arg, what, why) = TargetArgument(app, target);
             if (why != null) return DesktopCallResult.Fail("invalid_args", why + ". Nothing was opened.");
-            launch = app with { Arguments = string.IsNullOrEmpty(app.Arguments) ? arg : app.Arguments + " " + arg };
+            if (arg != null) launch = app with { Arguments = string.IsNullOrEmpty(app.Arguments) ? arg : app.Arguments + " " + arg };
             opens = what;
         }
         var (allowed, risk, policyReason) = _policy.EvaluatePolicy(DesktopActionTypes.AppLaunch, new Dictionary<string, string>(), app.ExeName ?? app.Name);
@@ -404,7 +431,7 @@ public sealed class AppLaunchRequestService : IDesktopActionRequestService
 
         var parameters = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["operation"] = target == null ? $"Open {app.Name}" : target.Kind == "search" ? $"Search the web in {app.Name}" : $"Open a folder in {app.Name}",
+            ["operation"] = target == null ? $"Open {app.Name}" : target.Kind == "search" ? $"Search the web in {app.Name}" : target.Kind == "new" ? $"Open {app.Name} ready for typing" : $"Open a folder in {app.Name}",
             ["application"] = app.Name,
             ["kind"] = app.Kind == InstalledApp.KindPackaged ? "Store / packaged app" : "desktop program",
             ["target"] = app.Target,
@@ -473,7 +500,9 @@ public sealed class AppLaunchRequestService : IDesktopActionRequestService
             return DesktopCallResult.Fail("journal_unavailable", "The action could not be recorded before acting, so it was not performed. Nothing was opened.");
         }
 
-        var before = _reader.SnapshotNow().Select(w => w.Hwnd).ToHashSet();
+        var beforeSnapshot = _reader.SnapshotNow();
+        var before = beforeSnapshot.Select(w => w.Hwnd).ToHashSet();
+        var titlesBefore = beforeSnapshot.GroupBy(w => w.Hwnd).ToDictionary(g => g.Key, g => g.First().Title);
         AppActivationResult act;
         try { act = _opts.Activator.Start(launch); }
         catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)   // ERROR_CANCELLED: the UAC prompt was declined
@@ -501,6 +530,15 @@ public sealed class AppLaunchRequestService : IDesktopActionRequestService
             {
                 seen = now.FirstOrDefault(w => w.Visible && w.Foreground && IsWindowOf(app, w, act.ProcessId) && (target == null || ShowsTarget(target, w)));
                 if (seen != null) break;
+                // 2026-11-16 (regression run): a browser that was already open shows the search as a new tab in its existing window, and
+                // Windows may keep that window behind (focus rules). Confirmed only when that window's title CHANGED to show the search
+                // after the start (its title before the start did not show it): never a window that already showed it.
+                if (target is { Kind: "search" })
+                {
+                    seen = now.FirstOrDefault(w => w.Visible && IsWindowOf(app, w, act.ProcessId) && ShowsTarget(target, w)
+                        && titlesBefore.TryGetValue(w.Hwnd, out var t0) && !ShowsTarget(target, w with { Title = t0 }));
+                    if (seen != null) break;
+                }
             }
             try { await Task.Delay(_opts.PollMs, ct); } catch (OperationCanceledException) { return DesktopCallResult.Cancelled(); }
         }
@@ -508,7 +546,8 @@ public sealed class AppLaunchRequestService : IDesktopActionRequestService
         {
             await AuditCatalogAsync("AppLaunchUnverified", request, ctx, app, "no window");
             return DesktopCallResult.Fail("launch_unverified",
-                $"{app.Name} was started{(act.Elevated ? " (with administrator permission)" : "")}, but no {app.Name} window{(target == null ? "" : target.Kind == "search" ? " showing the search \"" + target.Value + "\"" : " showing the folder " + Path.GetFileName(target.Value))} appeared within {_opts.WaitForAppWindowMs / 1000} s, so it is not confirmed.");
+                $"{app.Name} was started{(act.Elevated ? " (with administrator permission)" : "")}, but no {app.Name} window{(target == null || target.Kind == "new" ? "" : target.Kind == "search" ? " showing the search \"" + target.Value + "\"" : " showing the folder " + Path.GetFileName(target.Value))} appeared within {_opts.WaitForAppWindowMs / 1000} s, so it is not confirmed." +
+                (target?.Kind == "search" ? " If the computer is not actually connected to the internet (a network can be connected without internet access), the results page cannot load." : ""));
         }
         if (isNew) _registry.Record(ctx.TaskId, new LaunchedWindow(seen.Hwnd, seen.ProcessId, seen.ProcessCreationFileTime, seen.ImageName));
         await AuditCatalogAsync("AppLaunchPerformed", request, ctx, app, isNew ? "new window observed" : "existing window brought to the front");

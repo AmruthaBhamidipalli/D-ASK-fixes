@@ -113,10 +113,15 @@ export function actuationRefusal(o: string, inputOffered: (tool: string) => bool
   const session = appSession(o);
   if (session && inputOffered("desktop.launch_app") && (session.text === null || inputOffered("desktop.type_text"))) return null;
   if (session) return "I can't open applications or type into them in this installation (the daemon does not offer it), so I haven't done anything.";
+  const any = anyAppSession(o);
+  if (any && inputOffered("desktop.launch_app") && inputOffered("desktop.list_apps") && inputOffered("desktop.type_text")) return null;
+  if (any) return `I can't open ${any.name} and type into it in this installation (opening installed applications or keyboard input is switched off in the daemon), so I haven't done anything.`;
   // P1/P2: one element-bound click, text entry or allowed key chord is an approval request, not refused here, but ONLY
   // when the daemon offers that input tool. With input switched off it is refused exactly as before (no model call).
   const steps = requestedInputActions(o);
   if (steps.length > 0 && steps.every((a) => inputOffered(a.tool))) return null;
+  if (steps.length > 0)
+    return "I can't click, type or press keys in this installation: mouse or keyboard input is switched off in D-ASK's settings (AgentHost:DesktopMouseInput / AgentHost:DesktopKeyboardInput), so I haven't done anything.";
   // Browser stage 2: a request that is entirely clicks/fills on a named web page belongs to the browser tools, which
   // answer it (or refuse it when the daemon does not offer browser actions). Nothing here can act on a web page.
   if (requestedBrowserActions(o)) return null;
@@ -125,7 +130,9 @@ export function actuationRefusal(o: string, inputOffered: (tool: string) => bool
   // Phase 7B.2: focus / minimize / maximize / restore of one window are requests for approval, not refused here,
   // unless the same request also asks for something else (clicking, typing, …).
   if (!ACTUATION_ANYWHERE.test(o) && requestedWindowAction(o)) return null;
-  return "I can't click, type, scroll, move, resize, close or launch anything. I can list open windows, describe a window you name, and ask your approval to focus, minimize, maximize or restore a window (each one only with your approval in the HUD).";
+  return "I couldn't tell exactly which window, control or text that refers to, so I haven't done anything. Things I can do (each with your approval in the HUD): "
+    + "open any installed app (\"open Word\"), open an app and type into it (\"open Word and type hello\"), type or click in a named control "
+    + "(\"type 'x' into the Search box in the window titled 'y'\"), and focus, minimize, maximize or restore a named window.";
 }
 
 // ── Phase 7B.2: window-operation requests (approval only) ───────────────────
@@ -257,6 +264,12 @@ export const listWindowsCheck: ToolRequestCheck<ListInput, any> = {
     const d = facet.data as { process: string | null; title: string | null };
     return outcome.ok && !!o && o.complete === true && Array.isArray(o.windows) &&
       (input.process ?? null) === d.process && (input.titleContains ?? null) === d.title;
+  },
+  // The listing's selector is exactly what the request names (or nothing): derivable without the model.
+  stepFor(facet, objective) {
+    if (facet.tool !== "desktop.list_windows" || !isListRequest(objective)) return null;
+    const p = requestedProcess(objective), t = requestedTitle(objective);
+    return { ...(p ? { process: p } : {}), ...(t ? { titleContains: t } : {}) };
   },
   vocabulary: (objective) => [...VOCAB, ...appWords(objective)],
 };
@@ -632,6 +645,61 @@ export function appSession(o: string): AppSession | null {
   return { app: "notepad", process: "notepad.exe", text };
 }
 
+// ── "Open <any installed application> and type …" (2026-11-16): the typing target is the application's main editor ──
+
+/**
+ * Not a control name: the daemon resolves "the main editor" of the window IT opened for this task (the keyboard-focused document or
+ * text control, proven to belong to that window), and refuses anything else. No window selector is sent: the window is the launched one.
+ */
+export const MAIN_EDITOR = { controlType: "Editor", name: "main editor" } as const;
+/** Applications that are never typed into this way: browsers (address bar), consoles and shells (typed text is a command line). */
+const NO_EDITOR_SESSION = /^(?:google\s+)?chrome\b|\b(?:microsoft\s+)?edge\b|\bfirefox\b|\bbrave\b|\bopera\b|\bbrowser\b|\bcmd\b|\bcommand\s+prompt\b|\bpowershell\b|\bpwsh\b|\bterminal\b|\bwsl\b|\bbash\b|\bconsole\b|^run\b|\bregistry\b|\bregedit\b|\btask\s+manager\b|\bpassword\b|\bkeepass\b|\bbitwarden\b|\b1password\b/i;
+const OPEN_THEN_TYPE = /^\s*(?:please\s+|can you\s+|could you\s+)?(?:open|launch|start|run)\s+(?:up\s+)?(?:the\s+|a\s+|an\s+|my\s+)?(?:new\s+|blank\s+|empty\s+)?([\p{L}\p{N}][\p{L}\p{N} +#&'.-]{0,59}?)(?:\s+(?:app|application|program|window|document|doc))?\s*(?:,\s*|\s+)(?:and\s+)?(?:then\s+)?(?:type|write|enter)\s+([\s\S]+)$/iu;
+export interface AnyAppSession { name: string; text: string }
+
+/**
+ * "Open Microsoft Word and type hello", "launch WordPad, then write 'Dear Sam'": any installed application by the name the user said
+ * (the daemon resolves it), then the exact text into that application's main editor. Null for the fixed list (appSession owns it),
+ * browsers, consoles, and anything whose text could run on into another instruction (refused, never guessed).
+ */
+export function anyAppSession(o: string): AnyAppSession | null {
+  if (appSession(o)) return null;
+  const m = OPEN_THEN_TYPE.exec(o);
+  if (!m) return null;
+  const name = m[1]!.trim();
+  if (!name || NOT_AN_APP.some((re) => re.test(name)) || NO_EDITOR_SESSION.test(name)) return null;
+  if ((Object.keys(LAUNCHABLE) as AppKey[]).some((k) => new RegExp(String.raw`^(?:${LAUNCHABLE[k].words})$`, "i").test(name))) return null;
+  const body = m[2]!.trim();
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const inIt = new RegExp(String.raw`\s+(?:in|into)\s+(?:it|the\s+(?:editor|window|document|doc|page|text\s+area)|(?:the\s+)?${esc}(?:\s+(?:document|window))?)\s*$`, "i");
+  let text: string | null = null;
+  const q = /^["“'‘]([\s\S]{1,200}?)["”'’]([\s\S]*)$/.exec(body);
+  if (q) {
+    const tail = q[2]!.replace(/[.!?]+\s*$/, "").trim();
+    if (tail === "" || inIt.test(" " + tail)) text = q[1]!;
+  } else {
+    const plain = body.replace(/[.!?]+\s*$/, "").replace(inIt, "").trim();
+    if (plain.length >= 1 && plain.length <= 200 && !/["“”]/.test(plain) && !TEXT_RUNS_ON.test(plain)) text = plain;
+  }
+  if (text === null || text.length === 0 || [...text].some((c) => c.charCodeAt(0) < 32)) return null;
+  return { name, text };
+}
+
+/** "Type hello in Word": the open window of an application whose main editor is known to take typing (the daemon resolves ONE window). */
+const TYPE_IN_APP = /^\s*(?:please\s+|can you\s+|could you\s+)?(?:type|write|enter)\s+([\s\S]{1,220}?)\s+(?:in|into)\s+(?:the\s+|my\s+)?(?:open\s+)?(microsoft\s+word|word|notepad|wordpad)(?:\s+(?:window|document|doc|app))?\s*[.!]?\s*$/i;
+const TYPE_APP_PROCESS: Record<string, string> = { "word": "WINWORD.EXE", "microsoft word": "WINWORD.EXE", "notepad": "notepad.exe", "wordpad": "wordpad.exe" };
+export function typeInAppRequest(o: string): { process: string; text: string } | null {
+  const m = TYPE_IN_APP.exec(o);
+  if (!m) return null;
+  const process = TYPE_APP_PROCESS[m[2]!.toLowerCase().replace(/\s+/g, " ")];
+  if (!process) return null;
+  const body = m[1]!.trim();
+  const q = /^["“'‘]([\s\S]{1,200})["”'’]$/.exec(body);
+  const text = q ? q[1]! : !/["“”]/.test(body) && body.length <= 200 && !TEXT_RUNS_ON.test(body) ? body : null;
+  if (!text || [...text].some((c) => c.charCodeAt(0) < 32)) return null;
+  return { process, text };
+}
+
 const INPUT_VERB = "(?:click|type|enter|write|press|right[- ]?click|double[- ]?click|scroll|drag|select|highlight)";
 /** Step separators, only where the next word starts another input step: ", then", " and then", " then", " and", ";". */
 const STEP_SPLIT = new RegExp(`(?:\\s*,\\s*(?:and\\s+)?(?:then\\s+)?|\\s*;\\s*(?:then\\s+)?|\\s+(?:and\\s+)?then\\s+|\\s+and\\s+)(?=${INPUT_VERB}\\b)`, "gi");
@@ -694,6 +762,10 @@ export function requestedInputActions(o: string): InputActionRequest[] {
   // "Open Notepad and type X": the typing step is bound to Notepad's own editor (the window the launch opened).
   const session = appSession(o);
   if (session) return session.text === null ? [] : [{ tool: "desktop.type_text", text: session.text, keys: null, target: APP_EDITOR.name, controlType: APP_EDITOR.controlType }];
+  const any = anyAppSession(o);
+  if (any) return [{ tool: "desktop.type_text", text: any.text, keys: null, target: MAIN_EDITOR.name, controlType: MAIN_EDITOR.controlType }];
+  const inApp = typeInAppRequest(o);
+  if (inApp) return [{ tool: "desktop.type_text", text: inApp.text, keys: null, target: MAIN_EDITOR.name, controlType: MAIN_EDITOR.controlType }];
   if (INPUT_FORBIDDEN.test(o)) return [];
   if ((o.match(WINDOW_CLAUSE) ?? []).length > 1) return []; // one window per request
   const masked = mask(o);
@@ -751,12 +823,29 @@ const verbOf = (a: InputActionRequest) => {
 
 function inputCheck(tool: InputActionRequest["tool"], bridge: DesktopBridge): ToolRequestCheck<InputArgs, any> {
   /** The request's steps, only if the daemon offers every input tool they need (otherwise the request is refused). */
-  const stepsOf = (o: string) => { const s = requestedInputActions(o); return s.every((a) => offered(bridge, a.tool)) ? s : []; };
+  const stepsOf = (o: string) => {
+    const s = requestedInputActions(o);
+    // "Open <any app> and type …" needs the launch AND the installed-applications catalog; without them it is refused up front (actuationRefusal).
+    if (anyAppSession(o) && !(offered(bridge, "desktop.launch_app") && offered(bridge, "desktop.list_apps"))) return [];
+    return s.every((a) => offered(bridge, a.tool)) ? s : [];
+  };
   const mine = (o: string) => stepsOf(o).some((a) => a.tool === tool);
+  /** "Open <app> and type …": the window is the one the launch opens (bound by the daemon), so no window selector at all. */
+  const editorSession = (o: string) => tool === "desktop.type_text" && anyAppSession(o) !== null;
+  /** "Type hello in Word": the application's own window (by its process), its main editor. */
+  const inApp = (o: string) => (tool === "desktop.type_text" ? typeInAppRequest(o) : null);
+  const sel = (o: string): { p: string | null; t: string | null } =>
+    editorSession(o) ? { p: null, t: null } : inApp(o) ? { p: inApp(o)!.process, t: null } : { p: requestedProcess(o), t: requestedTitle(o) };
+  const noSelector = (): Record<string, ArgumentDomain> => ({
+    process: { kind: "forbidden", reason: "the window is the one D-ASK opens for this request" },
+    titleContains: { kind: "forbidden", reason: "the window is the one D-ASK opens for this request" },
+  });
   return {
     argumentDomains(objective) {
       const own = stepsOf(objective).filter((a) => a.tool === tool);
-      const d = domains(objective);
+      const d = editorSession(objective) ? noSelector()
+        : inApp(objective) ? { process: { kind: "enum", values: [inApp(objective)!.process], optional: false } as ArgumentDomain, titleContains: { kind: "forbidden", reason: "the request names the application, not a title" } as ArgumentDomain }
+        : domains(objective);
       const none: ArgumentDomain = { kind: "forbidden", reason: "the request names no control for this input" };
       d.controlType = own.length ? { kind: "enum", values: uniq(own.map((a) => a.controlType)), optional: false } : none;
       d.control = own.length ? { kind: "enum", values: uniq(own.map((a) => a.target)), optional: false } : none;
@@ -778,18 +867,17 @@ function inputCheck(tool: InputActionRequest["tool"], bridge: DesktopBridge): To
     },
     relevant: (o) => mine(o),
     // "Open Notepad and type X": the typing step belongs to this tool together with the launch (see createLaunchAppTool.claims).
-    claims: (o) => tool === "desktop.type_text" && appSession(o)?.text != null && mine(o) && offered(bridge, "desktop.launch_app"),
-    clarify: (o) => (mine(o) && !requestedProcess(o) && !requestedTitle(o)
+    claims: (o) => tool === "desktop.type_text" && mine(o) && (inApp(o) !== null || ((appSession(o)?.text != null || anyAppSession(o) !== null) && offered(bridge, "desktop.launch_app"))),
+    clarify: (o) => (mine(o) && !editorSession(o) && !sel(o).p && !sel(o).t
       ? "Which window do you mean? Quote its title (\"… in the window titled '…'\") or name the application. I won't pick a window for you."
       : null),
     facets(objective) {
       if (!mine(objective)) return [];
-      const p = requestedProcess(objective);
-      const t = requestedTitle(objective);
-      if (!p && !t) return [];
+      const { p, t } = sel(objective);
+      if (!p && !t && !editorSession(objective)) return [];
       const steps = stepsOf(objective);
       // In an application session the launch is step 0 of the same ordered sequence: the typing counts only AFTER the launch.
-      const lead = appSession(objective) ? 1 : 0;
+      const lead = appSession(objective) || anyAppSession(objective) ? 1 : 0;
       const total = steps.length + lead;
       const out: RequestFacet[] = [];
       steps.forEach((a, i) => {
@@ -804,8 +892,13 @@ function inputCheck(tool: InputActionRequest["tool"], bridge: DesktopBridge): To
     },
     ground(input, objective) {
       if (!mine(objective)) return ungrounded("the request does not ask for this input");
-      const sel = selectorMatches(input, objective);
-      if (sel.status !== "grounded") return sel;
+      const ia = inApp(objective);
+      const selector = editorSession(objective)
+        ? (input.process === undefined && input.titleContains === undefined ? grounded("the window is the one D-ASK opens for this request")
+          : contradicted("omit process and titleContains: the text goes into the window D-ASK opens for this request"))
+        : ia ? (input.process === ia.process && input.titleContains === undefined ? grounded("the application is the one the request names") : contradicted(`the request names ${ia.process}`))
+        : selectorMatches(input, objective);
+      if (selector.status !== "grounded") return selector;
       const own = stepsOf(objective).filter((a) => a.tool === tool);
       if (own.some((a) => isStep(tool, input, a))) return grounded("window, control and input are taken from the request");
       const a = own[0]!;
@@ -823,11 +916,12 @@ function inputCheck(tool: InputActionRequest["tool"], bridge: DesktopBridge): To
     },
     identicalStepsAllowed: (input, objective) => stepsOf(objective).filter((a) => isStep(tool, input as InputArgs, a)).length,
     stepFor(facet, objective) {
-      if (facet.tool !== tool || !facet.sequence || !mine(objective)) return null;
-      const a = stepsOf(objective)[facet.sequence.index - (appSession(objective) ? 1 : 0)];
-      const p = requestedProcess(objective);
-      const t = requestedTitle(objective);
-      if (!a || a.tool !== tool || (!p && !t)) return null;
+      if (facet.tool !== tool || !mine(objective)) return null;
+      // A sequence step by its index; a request that is exactly ONE input step (no sequence) by itself.
+      const all = stepsOf(objective);
+      const a = facet.sequence ? all[facet.sequence.index - (appSession(objective) || anyAppSession(objective) ? 1 : 0)] : all.length === 1 ? all[0] : undefined;
+      const { p, t } = sel(objective);
+      if (!a || a.tool !== tool || (!p && !t && !editorSession(objective))) return null;
       const input: InputArgs = { ...(p ? { process: p } : {}), ...(t ? { titleContains: t } : {}), controlType: a.controlType, control: a.target,
         ...(a.text != null ? { text: a.text } : {}), ...(a.keys != null ? { keys: a.keys } : {}),
         ...(a.to ? { toControl: a.to.target, toControlType: a.to.controlType } : {}),
@@ -901,8 +995,9 @@ function createInputTool(bridge: DesktopBridge, tool: InputActionRequest["tool"]
     timeoutMs: 60_000,
     async execute(input, ctx) {
       // An application session starts by opening the application: nothing is typed into a window this task did not open and confirm.
-      if (ctx.objective !== undefined && appSession(ctx.objective) && !launchedTasks.has(ctx.taskId))
-        return { ok: false, error: "This request begins by opening Notepad; nothing is typed until it has been opened and confirmed in this task. Nothing was sent.", evidence: "" };
+      const opening = ctx.objective !== undefined ? (appSession(ctx.objective) ? "Notepad" : anyAppSession(ctx.objective)?.name ?? null) : null;
+      if (opening !== null && !launchedTasks.has(ctx.taskId))
+        return { ok: false, error: `This request begins by opening ${opening}; nothing is typed until it has been opened and confirmed in this task. Nothing was sent.`, evidence: "" };
       const prog = inputProgress.get(ctx.taskId) ?? { next: 0, halted: false, asked: 0 };
       inputProgress.set(ctx.taskId, prog);
       const steps = ctx.objective !== undefined ? requestedInputActions(ctx.objective) : [];
@@ -926,7 +1021,8 @@ function createInputTool(bridge: DesktopBridge, tool: InputActionRequest["tool"]
       const args: Record<string, unknown> = {
         ...(input.process !== undefined ? { process: input.process } : {}),
         ...(input.titleContains !== undefined ? { titleContains: input.titleContains } : {}),
-        element: { controlType: input.controlType, name: input.control },
+        // The application's main editor (only in "open <app> and type …"): the daemon resolves it in the window it opened for this task.
+        element: input.controlType === MAIN_EDITOR.controlType && input.control === MAIN_EDITOR.name ? { role: "editor" } : { controlType: input.controlType, name: input.control },
         ...(input.text !== undefined ? { text: input.text } : {}),
         ...(input.keys !== undefined ? { keys: input.keys } : {}),
         ...(input.toControl !== undefined ? { to: { controlType: input.toControlType, name: input.toControl } } : {}),
@@ -1018,7 +1114,7 @@ export const installedAppsRequest = (o: string): { filter: string | null } | nul
 const launchedTasks = new Set<string>();
 const launchAsked = new Set<string>();
 
-type LaunchInput = { app: string; search?: string; folder?: string };
+type LaunchInput = { app: string; search?: string; folder?: string; newDocument?: boolean };
 function createLaunchAppTool(bridge: DesktopBridge): ToolSpec<LaunchInput, any> {
   const fixedMine = (o: string) => {
     const s = appSession(o);
@@ -1026,16 +1122,18 @@ function createLaunchAppTool(bridge: DesktopBridge): ToolSpec<LaunchInput, any> 
   };
   /** Any other installed application, by the name the user said: only when the daemon offers its catalog of installed applications. */
   const catalog = () => offered(bridge, "desktop.launch_app") && offered(bridge, "desktop.list_apps");
+  /** "Open <any app> and type …": opened ready for typing (a new blank document where the application has one), then typed into. */
+  const typingSession = (o: string): AnyAppSession | null => (catalog() && offered(bridge, "desktop.type_text") ? anyAppSession(o) : null);
   /** An application WITH a web search or a folder to open in it ("open Chrome and search for ...", "open the folder D:\x in VS Code"). */
   const targeted = (o: string): OpenTargetRequest | null => (catalog() ? openTargetRequest(o) : null);
   /** "Open github.com in Chrome" belongs to the Chrome tools when the daemon offers them (2026-11-14). */
   const chromeOwned = (o: string) => { const c = chromeRequest(o); return c !== null && offered(bridge, c.tool); };
   const generic = (o: string): string | null =>
     targeted(o) === null && appSession(o) === null && catalog() && !chromeOwned(o) ? openAppRequest(o) : null;
-  const mine = (o: string) => fixedMine(o) || generic(o) !== null || targeted(o) !== null;
-  const appOf = (o: string): string => (fixedMine(o) ? appSession(o)!.app : targeted(o)?.app ?? generic(o)!);
+  const mine = (o: string) => fixedMine(o) || generic(o) !== null || targeted(o) !== null || typingSession(o) !== null;
+  const appOf = (o: string): string => (fixedMine(o) ? appSession(o)!.app : typingSession(o)?.name ?? targeted(o)?.app ?? generic(o)!);
   /** Exactly what the request asks to open: the application name and, when given, its search or folder (all as the user said them). */
-  const want = (o: string): LaunchInput => targeted(o) ?? { app: appOf(o) };
+  const want = (o: string): LaunchInput => targeted(o) ?? (typingSession(o) ? { app: typingSession(o)!.name, newDocument: true } : { app: appOf(o) });
   const forbidden = (why: string) => ({ kind: "forbidden" as const, reason: why });
   const check: ToolRequestCheck<LaunchInput, any> = {
     argumentDomains: (o): Record<string, ArgumentDomain> => {
@@ -1045,6 +1143,7 @@ function createLaunchAppTool(bridge: DesktopBridge): ToolSpec<LaunchInput, any> 
         app: { kind: "enum", values: [w.app], optional: false },
         search: w.search !== undefined ? { kind: "enum", values: [w.search], optional: false } : forbidden("the request asks for no web search"),
         folder: w.folder !== undefined ? { kind: "enum", values: [w.folder], optional: false } : forbidden("the request names no folder"),
+        newDocument: w.newDocument ? { kind: "enum", values: [true] as any, optional: false } : forbidden("the request does not type into the application"),
       };
     },
     relevant: mine,
@@ -1055,6 +1154,9 @@ function createLaunchAppTool(bridge: DesktopBridge): ToolSpec<LaunchInput, any> 
       const t = targeted(o);
       if (t !== null) return [{ id: `app:launch:${t.app.toLowerCase()}:${t.search !== undefined ? "search" : "folder"}`, tool: "desktop.launch_app",
         description: t.search !== undefined ? `open ${t.app} and search for "${t.search}"` : `open ${t.folder} in ${t.app}`, data: { ...t } }];
+      const ty = typingSession(o);
+      if (ty !== null) return [{ id: `app:launch:${ty.name.toLowerCase()}:typing`, tool: "desktop.launch_app", description: `open ${ty.name} (ready for typing)`,
+        data: { app: ty.name, newDocument: true }, sequence: { key: "input-steps", index: 0, of: 2 } }];
       const g = generic(o);
       if (g !== null) return [{ id: `app:launch:${g.toLowerCase()}`, tool: "desktop.launch_app", description: `open ${g}`, data: { app: g } }];
       const withText = appSession(o)!.text !== null;
@@ -1068,19 +1170,28 @@ function createLaunchAppTool(bridge: DesktopBridge): ToolSpec<LaunchInput, any> 
       if (input.app !== w.app) return contradicted(`the request names ${w.app}`);
       if ((input.search ?? undefined) !== w.search) return contradicted(w.search !== undefined ? `the request searches for "${w.search}"` : "the request asks for no web search");
       if ((input.folder ?? undefined) !== w.folder) return contradicted(w.folder !== undefined ? `the request names the folder ${w.folder}` : "the request names no folder");
+      if ((input.newDocument ?? undefined) !== w.newDocument) return contradicted(w.newDocument ? "the application is opened ready for typing (newDocument: true)" : "omit newDocument: nothing is typed");
       return grounded("the application (and what to open in it) are the ones the request names");
     },
     // Satisfied only when the daemon opened the application AND a fresh look at the desktop showed its window (showing the search/folder).
     satisfies: (f, input, outcome) => {
       const d = f.data as LaunchInput;
       return outcome.ok && outcome.output?.launched === true && outcome.output?.verified === true && input.app === d.app &&
-        (input.search ?? undefined) === d.search && (input.folder ?? undefined) === d.folder;
+        (input.search ?? undefined) === d.search && (input.folder ?? undefined) === d.folder && (input.newDocument ?? undefined) === d.newDocument;
     },
     stepFor: (f, o) => (f.tool === "desktop.launch_app" && mine(o) ? want(o) : null),
     // The request dictates the order: the launch first (exactly one), then whatever else was planned, and the typing step the request
     // spells out if the model left it out. The model's own values are kept for the steps it proposed (they are validated against the
     // request like always); the steps added here carry only values taken from the request text.
     arrangeSteps(steps, o) {
+      const ty = typingSession(o);
+      if (ty !== null) {
+        // "Open <app> and type …" is exactly: the launch, then the typing into its main editor (values from the request only).
+        const launch = steps.find((x) => x.tool === "desktop.launch_app") ?? { id: "app_open", description: `open ${ty.name}`, tool: "desktop.launch_app", input: want(o) };
+        const typed = steps.find((x) => x.tool === "desktop.type_text")
+          ?? { id: "app_type", description: `type the text into ${ty.name}`, tool: "desktop.type_text", input: { controlType: MAIN_EDITOR.controlType, control: MAIN_EDITOR.name, text: ty.text } };
+        return [{ ...launch, dependsOn: undefined }, { ...typed, dependsOn: undefined }];
+      }
       const g = generic(o) ?? targeted(o)?.app ?? null;
       if (g !== null) {
         // "open <name>" (with its search or folder) is exactly one launch: nothing else the model may have added belongs to it.
@@ -1098,7 +1209,8 @@ function createLaunchAppTool(bridge: DesktopBridge): ToolSpec<LaunchInput, any> 
       return [{ ...launch, dependsOn: undefined }, ...rest.map((x) => ({ ...x, dependsOn: undefined })), ...typing];
     },
     vocabulary: (o) => ["open", "launch", "start", "run", "up", "notepad", "calculator", "calc", "character", "map", "charmap", "app", "application", "program", "window", "type", "write", "enter", "in", "into", "it", "then", "and", "please", "the", "a", "an",
-      ...contentWords(generic(o) ?? ""), ...contentWords(targeted(o)?.app ?? ""), ...contentWords(targeted(o)?.search ?? ""), "search", "for", "web", "folder", "project", "directory", "with", "on", "at", "my"],
+      ...contentWords(generic(o) ?? ""), ...contentWords(targeted(o)?.app ?? ""), ...contentWords(typingSession(o)?.name ?? ""), ...contentWords(typingSession(o)?.text ?? ""),
+      "new", "blank", "empty", "document", "doc", "my", ...contentWords(targeted(o)?.search ?? ""), "search", "for", "web", "folder", "project", "directory", "with", "on", "at", "my"],
   };
   return {
     name: "desktop.launch_app",
@@ -1107,6 +1219,7 @@ function createLaunchAppTool(bridge: DesktopBridge): ToolSpec<LaunchInput, any> 
       app: { type: "string", minLength: 1, maxLength: 80 },
       search: { type: "string", minLength: 1, maxLength: 200, description: "only when the request asks to search the web in a browser: the words exactly as said" },
       folder: { type: "string", minLength: 3, maxLength: 200, description: "only when the request names a folder to open (e.g. in VS Code): the path exactly as said" },
+      newDocument: { type: "boolean", description: "only when the request then types into the application: open it ready for typing (a new blank document)" },
     }, required: ["app"] },
     permissions: ["request:desktop_action"],
     risk: "medium",
@@ -1116,7 +1229,8 @@ function createLaunchAppTool(bridge: DesktopBridge): ToolSpec<LaunchInput, any> 
       if (launchAsked.has(ctx.taskId)) return { ok: false, error: "Already asked to open an application in this task; not asking again.", evidence: "" };
       launchAsked.add(ctx.taskId);
       const { reply, error } = await callDaemon(bridge, "desktop.launch_app",
-        { app: input.app, ...(input.search !== undefined ? { search: input.search } : {}), ...(input.folder !== undefined ? { folder: input.folder } : {}) }, ctx, 70_000);
+        { app: input.app, ...(input.search !== undefined ? { search: input.search } : {}), ...(input.folder !== undefined ? { folder: input.folder } : {}),
+          ...(input.newDocument === true ? { newDocument: true } : {}) }, ctx, 70_000);
       if (!reply) return { ok: false, error: error!, evidence: "" };
       if (reply.status === "cancelled") return { ok: false, error: "The request was cancelled. Nothing was opened.", evidence: "" };
       if (reply.status !== "ok") return { ok: false, error: reply.error?.message ?? "The request was not approved. Nothing was opened.", evidence: "" };

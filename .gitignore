@@ -55,6 +55,8 @@ playwright-report/
 test-results/
 coverage/
 .nyc_output/
+*.wav
+!public/media/wake.wav
 results/*/
 !results/graphs/
 !results/logs/

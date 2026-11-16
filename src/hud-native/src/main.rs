@@ -439,7 +439,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let path = req.uri().path().to_string();
             debug!("[CUSTOM PROTOCOL] Request: {}", path);
 
-            // Offline STT: the page POSTs 16-bit PCM WAV; Windows SAPI transcribes it on its own thread (never this one).
+            // Which speech engine is really usable (QA BUG-003): verified by hashing, on its own thread (the model is ~60 MB once).
+            if path == "/api/stt/status" {
+                let root = root_for_protocol.clone();
+                std::thread::spawn(move || {
+                    let body = stt::engine_status(&root);
+                    responder.respond(Response::builder().status(StatusCode::OK).header("Content-Type", "application/json")
+                        .body(Cow::Owned(body.to_string().into_bytes())).unwrap());
+                });
+                return;
+            }
+
+            // Offline STT: the page POSTs 16-bit PCM WAV; whisper.cpp (verified) or Windows SAPI transcribes it on its own thread.
             if path == "/api/stt" {
                 let json = |status: StatusCode, body: serde_json::Value| Response::builder()
                     .status(status)
@@ -454,7 +465,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::thread::spawn(move || {
                     let file = std::env::temp_dir().join(format!("dask-stt-{}.wav", uuid::Uuid::new_v4()));
                     let t0 = std::time::Instant::now();
-                    let result = std::fs::write(&file, &body).map_err(|e| e.to_string()).and_then(|_| stt::transcribe(&stt_root, &file, &body));
+                    let detailed = std::fs::write(&file, &body).map_err(|e| e.to_string()).and_then(|_| stt::transcribe_detailed(&stt_root, &file, &body));
+                    let fallback = detailed.as_ref().ok().and_then(|t| t.fallback_reason.clone());
+                    let result = detailed.map(|t| (t.text, t.engine));
                     // Acceptance evidence ONLY: DASK_STT_EVIDENCE_DIR (unset in normal use; set by scripts\hud\voice-live.ps1 for its own
                     // stack) keeps the recording and its transcript in that folder. Otherwise the recording is never kept.
                     let stem = format!("utt-{}", chrono::Utc::now().format("%H%M%S%3f"));
@@ -470,14 +483,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Acceptance ONLY (DASK_VOICE_GATE_DIR, unset in normal use): the page gets the text only if the harness
                             // released it for the open test step; otherwise "" (the page never submits an empty transcript).
                             match voice_gate::gate_dir() {
-                                None => responder.respond(json(StatusCode::OK, serde_json::json!({ "text": text, "engine": engine }))),
+                                None => responder.respond(json(StatusCode::OK, serde_json::json!({ "text": text, "engine": engine, "fallbackReason": fallback }))),
                                 Some(gate) => match voice_gate::hold(&gate, &stem, &text, engine, &body, received, voice_gate::VERDICT_TIMEOUT) {
                                     voice_gate::Outcome::Released(t) => responder.respond(json(StatusCode::OK, serde_json::json!({ "text": t, "engine": engine, "gate": "released" }))),
                                     voice_gate::Outcome::Withheld(why) => responder.respond(json(StatusCode::OK, serde_json::json!({ "text": "", "engine": engine, "gate": "withheld", "reason": why }))),
                                 },
                             }
                         }
-                        Err(e) => { warn!("[STT] Transcription failed: {}", e); responder.respond(json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "transcription failed" }))) }
+                        // The reason is engine state only (never audio or text), so the page can say why voice input did not work.
+                        Err(e) => { warn!("[STT] Transcription failed: {}", e); responder.respond(json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "transcription failed", "reason": e }))) }
                     }
                 });
                 return;

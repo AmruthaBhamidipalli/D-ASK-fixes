@@ -317,22 +317,20 @@ export function parseApprovalRequest(payload: unknown): { view: ApprovalView } |
   } else if (actionType === "App.Launch") {
     const p = (n: string) => parameters.find((x) => x.name === n)?.value;
     const operation = p("operation"), app = p("application"), exe = p("executable"), args = p("arguments");
+    const target = p("target"), opens = p("opens");
     if (exe !== undefined) {
-      // The daemon's fixed list (Notepad, Calculator, Character Map): the file must be the named program, with no arguments.
+      // The daemon's fixed list: the program in the system folder, never any arguments.
       if (!operation || !app || !exe || args !== "none" || !operation.startsWith("Open ") || !exe.toLowerCase().endsWith(`\\${app.toLowerCase()}`))
         return fail("The application, its file or its (empty) arguments are not given exactly; it will not be offered.");
       summary = `Open ${app} (${exe}) once, with no arguments. A new window should appear; nothing is typed, saved or changed by opening it.`;
     } else {
-      // Any installed application the daemon resolved by name (Chrome, Word, a Store app...). The card must show exactly what Windows
-      // starts: the registered program or package, and the arguments of its own shortcut ("none" when it has none). Anything missing,
-      // or an operation that does not name that application, offers no decision.
-      const kind = p("kind"), target = p("target"), opens = p("opens");
-      const named = !!operation && !!app && /^(Open |Search the web in |Open a folder in )/.test(operation) && operation.endsWith(app);
-      if (!named || !kind || !target || args === undefined || args === "")
-        return fail("The application, its file or its (empty) arguments are not given exactly; it will not be offered.");
-      const argText = args === "none" ? "no arguments" : `exactly these arguments: ${args}`;
-      const what = opens && !opens.startsWith("nothing") ? ` It opens: ${opens}.` : "";
-      summary = `${operation} (${kind}: ${target}) once, with ${argText}.${what} A new window should appear; nothing is typed, saved or changed by opening it.`;
+      // An installed application Windows registers (2026-11-16): the program or packaged app, and EXACTLY the arguments it is started with
+      // (its own shortcut's, plus a search address, a folder or a blank-document switch the daemon built) are shown as they will be used.
+      if (!operation || !app || !target || args === undefined || !opens || /[\u0000-\u001f]/.test(args + target)
+        || !/^(Open |Search the web in )/.test(operation))
+        return fail("The application, what Windows starts for it or its arguments are not given exactly; it will not be offered.");
+      summary = `${operation}: Windows starts ${target}${args === "none" ? " with no arguments" : ` with the arguments ${args}`}, which opens ${opens}. `
+        + "Nothing is typed, saved or changed by opening it.";
     }
   } else if (FILE_TYPES.has(actionType)) {
     const s = filesSummary(actionType, parameters);

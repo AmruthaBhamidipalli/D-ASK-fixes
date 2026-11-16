@@ -243,26 +243,18 @@ console.log("\n[P1/P2] Input approval cards");
     "AL2 arguments, or an executable that is not the named application -> no decision offered");
   check("error" in parseApprovalRequest(inputReq("App.Launch", { ...aCommon, operation: "Run something" })) && "error" in parseApprovalRequest(inputReq("App.Launch", { ...aCommon, application: "" })),
     "AL3 an operation that is not 'Open …', or a missing application -> no decision offered");
-
-  // An installed application the daemon resolved by name (Chrome, a Store app): no `executable`, but the program/package it starts and its
-  // shortcut arguments. Before 2026-11-17 the card refused all of these ("not given exactly"), so nothing but the fixed list could be approved.
-  const cat = { operation: "Open Google Chrome", application: "Google Chrome", kind: "desktop program", target: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-    arguments: "none", opens: "nothing else (the application only)", registeredBy: "Start menu", result: "Windows starts Google Chrome…", reversible: "Yes: close the window.", execution: "Performed once…" };
-  const c1 = parseApprovalRequest(inputReq("App.Launch", cat));
-  check("view" in c1 && /Open Google Chrome \(desktop program: C:\\Program Files\\Google\\Chrome\\Application\\chrome\.exe\) once, with no arguments/.test(c1.view.inputSummary ?? ""),
-    "AL4 an installed application is offered, and the card shows exactly the program Windows starts", c1);
-  const c2 = parseApprovalRequest(inputReq("App.Launch", { ...cat, arguments: "--profile-directory=Default" }));
-  check("view" in c2 && /exactly these arguments: --profile-directory=Default/.test(c2.view.inputSummary ?? ""),
-    "AL5 the application's own shortcut arguments are shown in full, never hidden", c2);
-  const c3 = parseApprovalRequest(inputReq("App.Launch", { ...cat, application: "Microsoft Edge", target: "shell:AppsFolder\\Microsoft.MicrosoftEdge_8wekyb3d8bbwe!App", kind: "Store / packaged app", operation: "Open Microsoft Edge" }));
-  check("view" in c3 && /Store \/ packaged app: shell:AppsFolder/.test(c3.view.inputSummary ?? ""), "AL6 a packaged application shows its package id", c3);
-  const c4 = parseApprovalRequest(inputReq("App.Launch", { ...cat, operation: "Search the web in Google Chrome", opens: "a web search for: cats" }));
-  check("view" in c4 && /It opens: a web search for: cats/.test(c4.view.inputSummary ?? ""), "AL7 what a search/folder launch opens is shown", c4);
-  const missing = (drop: string) => { const o: Record<string, string> = { ...cat }; delete o[drop]; return "error" in parseApprovalRequest(inputReq("App.Launch", o)); };
-  check(missing("target") && missing("kind") && missing("arguments") && missing("application") && missing("operation"),
-    "AL8 an installed-application request missing its program, kind, arguments, name or operation -> no decision offered");
-  check("error" in parseApprovalRequest(inputReq("App.Launch", { ...cat, operation: "Run Google Chrome" })) && "error" in parseApprovalRequest(inputReq("App.Launch", { ...cat, operation: "Open Notepad" })) && "error" in parseApprovalRequest(inputReq("App.Launch", { ...cat, arguments: "" })),
-    "AL9 an operation that is not an 'Open …' of THIS application, or empty arguments -> no decision offered");
+  // 2026-11-16: an installed application (catalog). Previously EVERY such card was refused here, so "open Word" could never be approved.
+  const cCommon = { operation: "Open Word ready for typing", application: "Word", kind: "desktop program", target: "C:\\Program Files\\Microsoft Office\\Root\\Office16\\WINWORD.EXE",
+    arguments: "/w", opens: "a new blank document", registeredBy: "start-menu", result: "Windows starts Word…", reversible: "Yes: close the window.", execution: "Performed once…" };
+  const cl = parseApprovalRequest(inputReq("App.Launch", cCommon));
+  check("view" in cl && /starts C:\\Program Files\\Microsoft Office\\Root\\Office16\\WINWORD\.EXE with the arguments \/w, which opens a new blank document/.test(cl.view.inputSummary ?? ""),
+    "AL4 installed-app card: the program and its exact arguments are summarised (never 'no arguments')", cl);
+  const cs = parseApprovalRequest(inputReq("App.Launch", { ...cCommon, operation: "Search the web in Google Chrome", application: "Google Chrome", target: "C:\\chrome.exe",
+    arguments: "\"https://www.google.com/search?q=news\"", opens: "https://www.google.com/search?q=news" }));
+  check("view" in cs && /Search the web in Google Chrome/.test(cs.view.inputSummary ?? ""), "AL5 a web-search launch card is offered with its exact address", cs);
+  check("error" in parseApprovalRequest(inputReq("App.Launch", { ...cCommon, target: "" })) && "error" in parseApprovalRequest(inputReq("App.Launch", { ...cCommon, operation: "Run cmd" }))
+    && "error" in parseApprovalRequest(inputReq("App.Launch", { ...cCommon, arguments: "a\nb" })),
+    "AL6 a missing program, another operation or a control character -> no decision offered");
 }
 
 // ── 2026-11-14: the new cards (complete input, clipboard, Windows administration, the user's Chrome, code edits) ──

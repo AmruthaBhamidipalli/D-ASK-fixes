@@ -137,7 +137,7 @@ public sealed partial class ChromeService : IDesktopActionRequestService, IDispo
             {
                 Uri? uri = null;
                 if (Str(a, "url") is { } u && CheckUrl(u, out uri) is { } bad) return Bad(bad);
-                if (uri != null && !IsLocal(uri) && !Online()) return DesktopCallResult.Fail("offline", "This computer is offline, so the web page cannot be loaded. Nothing was opened.");
+                if (uri != null && !IsLocal(uri) && !Online()) return DesktopCallResult.Fail("offline", "Windows reports no network connection on this computer, so the web page cannot be loaded. Nothing was opened.");
                 if (await EnsureConnected(true, ct) is { } nc) return nc;
                 if (await EnsureAuthorized(ctx, ct) is { } na) return na;
                 if (uri == null) return DesktopCallResult.Ok(new { executed = true, verified = true, observed = "Chrome is open and connected to D-ASK" });
@@ -146,8 +146,8 @@ public sealed partial class ChromeService : IDesktopActionRequestService, IDispo
             case Search:
             {
                 if (Str(a, "query") is not { Length: > 0 and <= 300 } q) return Bad("query is required (up to 300 characters)");
-                if (!_o.WebSearchAllowed) return DesktopCallResult.Fail("web_search_off", "Web searches are switched off (offline-first; AgentHost:WebSearch). Nothing was searched.");
-                if (!Online()) return DesktopCallResult.Fail("offline", "This computer is offline, so a web search is not possible. Nothing was searched.");
+                if (!_o.WebSearchAllowed) return DesktopCallResult.Fail("web_search_off", "Web search is switched off in D-ASK's settings (offline-first: AgentHost:WebSearch is off). This is a D-ASK setting, not a problem with your internet connection. To allow it, add \"set DASK_AgentHost__WebSearch=true\" to %LOCALAPPDATA%\\D-ASK\\features.cmd and restart D-ASK. Nothing was searched.");
+                if (!Online()) return DesktopCallResult.Fail("offline", "Windows reports no network connection on this computer, so a web search is not possible. Nothing was searched.");
                 if (await EnsureConnected(true, ct) is { } nc) return nc;
                 if (await EnsureAuthorized(ctx, ct) is { } na) return na;
                 var su = new Uri("https://www.google.com/search?q=" + Uri.EscapeDataString(q));
@@ -170,13 +170,13 @@ public sealed partial class ChromeService : IDesktopActionRequestService, IDispo
             case OpenTab:
             {
                 if (CheckUrl(Str(a, "url"), out var uri) is { } bad) return Bad(bad);
-                if (!IsLocal(uri!) && !Online()) return DesktopCallResult.Fail("offline", "This computer is offline, so the web page cannot be loaded. Nothing was opened.");
+                if (!IsLocal(uri!) && !Online()) return DesktopCallResult.Fail("offline", "Windows reports no network connection on this computer, so the web page cannot be loaded. Nothing was opened.");
                 return await TabResult("openTab", new { url = uri!.ToString(), active = true }, uri, ct);
             }
             case Navigate:
             {
                 if (CheckUrl(Str(a, "url"), out var uri) is { } bad) return Bad(bad);
-                if (!IsLocal(uri!) && !Online()) return DesktopCallResult.Fail("offline", "This computer is offline, so the web page cannot be loaded. Nothing was changed.");
+                if (!IsLocal(uri!) && !Online()) return DesktopCallResult.Fail("offline", "Windows reports no network connection on this computer, so the web page cannot be loaded. Nothing was changed.");
                 int? tab = await TabOf(a, ct);
                 if (tab == null) return DesktopCallResult.Fail("no_tab", "There is no Chrome tab to navigate.");
                 return await TabResult("navigate", new { tabId = tab, url = uri!.ToString() }, uri, ct);
@@ -337,7 +337,20 @@ public sealed partial class ChromeService : IDesktopActionRequestService, IDispo
         using (Process.Start(new ProcessStartInfo(exe) { UseShellExecute = false })) { }
         var sw = Stopwatch.StartNew();
         while (!_broker.Connected && sw.ElapsedMilliseconds < _o.ConnectWaitMs) await Task.Delay(250, ct);
-        return _broker.Connected ? null : DesktopCallResult.Fail("extension_missing", "Chrome opened, but the D-ASK extension did not connect. Install it (chrome://extensions → Developer mode → Load unpacked → the D-ASK 'extensions\\dask-chrome' folder) and run scripts\\chrome\\register-native-host.ps1 once.");
+        return _broker.Connected ? null : DesktopCallResult.Fail("extension_missing",
+            $"Chrome is open, but the D-ASK extension did not connect within {_o.ConnectWaitMs / 1000} s, so D-ASK cannot read or control its pages yet. One-time setup: in Chrome open chrome://extensions, switch on Developer mode, " +
+            $"choose \"Load unpacked\" and select the folder {ExtensionFolder()}; then ask again. (Opening Chrome, or \"open Chrome and search for …\", works without the extension.)");
+    }
+
+    /// <summary>The installed extension folder (for the first-run instruction): the nearest "extensions\dask-chrome" above the daemon.</summary>
+    internal static string ExtensionFolder()
+    {
+        for (var d = new DirectoryInfo(AppContext.BaseDirectory); d != null; d = d.Parent)
+        {
+            var p = Path.Combine(d.FullName, "extensions", "dask-chrome");
+            if (Directory.Exists(p)) return p;
+        }
+        return @"extensions\dask-chrome (in the D-ASK install folder)";
     }
 
     /// <summary>One approval authorizes controlling THIS connected Chrome until revoked, Emergency Stop, disconnect, restart or the lifetime.</summary>

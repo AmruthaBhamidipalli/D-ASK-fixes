@@ -108,7 +108,7 @@ async function main() {
   const engine = new PlaywrightEngine({ navigationTimeoutMs: 15_000, evidenceDir });
   const sessions = new BrowserSessions(engine);
   const runReq = (d: Daemon, m: LanguageModel, objective: string, taskId = `bt${Math.random()}`.replace(".", "")) =>
-    new AgentRuntime({ model: m, registry: createDefaultRegistry(ROOT, { browser: engine, browserSessions: sessions, desktop: d }), granted: GRANTS }).run({ taskId, objective });
+    new AgentRuntime({ model: m, registry: createDefaultRegistry(ROOT, { browser: engine, browserSessions: sessions, desktop: d }), granted: GRANTS, requestPlans: false }).run({ taskId, objective });
   const form = `On ${base}/form, type "me@example.com" into the Email field, then click the Subscribe button`;
   try {
     {
@@ -202,7 +202,7 @@ async function main() {
       const ac = new AbortController();
       d.hook = async () => { ac.abort(); };
       const taskId = "live-cancel";
-      const r = await new AgentRuntime({ model: new Scripted([plan([click("button", "Subscribe")])]), registry: createDefaultRegistry(ROOT, { browser: engine, browserSessions: sessions, desktop: d }), granted: GRANTS })
+      const r = await new AgentRuntime({ model: new Scripted([plan([click("button", "Subscribe")])]), registry: createDefaultRegistry(ROOT, { browser: engine, browserSessions: sessions, desktop: d }), granted: GRANTS, requestPlans: false })
         .run({ taskId, objective: `On ${base}/form, click the Subscribe button`, signal: ac.signal } as any);
       check(r.outcome !== "completed" && sessions.get(taskId) === undefined, "L15 cancellation (Emergency Stop) while waiting for approval: nothing done, browser closed", { o: r.outcome });
     }

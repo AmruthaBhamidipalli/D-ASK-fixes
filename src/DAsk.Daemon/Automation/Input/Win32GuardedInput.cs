@@ -38,6 +38,14 @@ public interface IDesktopInputPlatform
     bool PointIsOnControl(long hwnd, int x, int y, int[] runtimeId) => RuntimeIdAt(x, y) is { } h && h.AsSpan().SequenceEqual(runtimeId);
     /// <summary>How many visible top-level windows the process has (a context menu or popup is usually one more).</summary>
     int VisibleWindowsOf(int pid) => 0;
+    /// <summary>
+    /// The window's main editor (2026-11-16): the keyboard-focused Document control of THIS window (same process, inside this window);
+    /// else the window's only Document control; else, when the window has no Document at all, its focused Edit. Never a password field.
+    /// Null when none qualifies or the choice would be ambiguous. Read-only: nothing is focused or changed.
+    /// </summary>
+    ControlIdentity? FindEditor(long hwnd, int pid) => null;
+    /// <summary>The editor's whole text (ValuePattern, else TextPattern document range). Used only to verify typing; never logged.</summary>
+    (bool Ok, string Text) ReadEditorText(long hwnd, int[] runtimeId) => (false, "");
 }
 
 /// <summary>The real platform: SendInput, low-level hooks, Win32 window queries and UI Automation (COM).</summary>
@@ -179,6 +187,108 @@ public sealed class Win32DesktopInputPlatform : IDesktopInputPlatform
         finally { Marshal.ReleaseComObject(tp); }
     }));
 
+    // ── The main editor of a window (2026-11-16) ──
+    private const int P_Bounds = 30001, P_ProcessId = 30002, P_ControlType = 30003, P_Name = 30005, P_Focusable = 30009, P_Enabled = 30010,
+        P_AutomationId = 30011, P_ClassName = 30012, P_NativeWindow = 30020, P_IsPassword = 30019, P_Offscreen = 30022, P_HasText = 30040, P_HasValue = 30043;
+    private const int CT_Document = 50030, CT_Edit = 50004;
+
+    private static object? Prop(IUIAutomationElement e, int id) { try { return e.GetCurrentPropertyValue(id, out var v) == 0 ? v : null; } catch { return null; } }
+
+    /// <summary>The element as an editor of THIS window, or null: right type, this process, inside this window, usable, never a password field.</summary>
+    private static ControlIdentity? EditorOf(IUIAutomationElement e, long hwnd, int pid, int wantType)
+    {
+        if (Prop(e, P_ControlType) is not int ct || ct != wantType) return null;
+        if (Prop(e, P_ProcessId) is not int p || p != pid) return null;
+        if (Prop(e, P_IsPassword) is true || Prop(e, P_Enabled) is not true || Prop(e, P_Offscreen) is true || Prop(e, P_Focusable) is not true) return null;
+        bool text = Prop(e, P_HasText) is true, value = Prop(e, P_HasValue) is true;
+        if (!text && !value) return null;
+        if (Prop(e, P_Bounds) is not double[] r || r.Length != 4 || r[2] < 2 || r[3] < 2) return null;
+        int[] b = { (int)Math.Round(r[0]), (int)Math.Round(r[1]), (int)Math.Round(r[0] + r[2]), (int)Math.Round(r[1] + r[3]) };
+        // Inside this window: its own native window's root is the window; otherwise the window under its centre is.
+        long root = 0;
+        if (Prop(e, P_NativeWindow) is int nh && nh != 0) root = N.GetAncestor(new IntPtr(nh), 2).ToInt64();
+        if (root == 0) { var w = N.WindowFromPoint(new N.POINT { X = (b[0] + b[2]) / 2, Y = (b[1] + b[3]) / 2 }); root = w == IntPtr.Zero ? 0 : N.GetAncestor(w, 2).ToInt64(); }
+        if (root != hwnd) return null;
+        if (RuntimeId(e) is not { Length: > 0 } rid) return null;
+        string name = Prop(e, P_Name) as string ?? "", aid = Prop(e, P_AutomationId) as string ?? "", cls = Prop(e, P_ClassName) as string ?? "";
+        if (name.Length > 160) name = name[..160];
+        string type = ct == CT_Document ? "Document" : "Edit";
+        string path = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes($"editor|{type}|{name}|{aid}|{cls}")));
+        var patterns = new List<string>(); if (text) patterns.Add("Text"); if (value) patterns.Add("Value");
+        return new ControlIdentity(rid, type, aid, name, path, false, b, true, false, true, patterns);
+    }
+
+    public ControlIdentity? FindEditor(long hwnd, int pid) => WithUia(uia =>
+    {
+        ControlIdentity? Focused(int type)
+        {
+            if (uia.GetFocusedElement(out var f) != 0 || f == null) return null;
+            try { return EditorOf(f, hwnd, pid, type); } finally { Marshal.ReleaseComObject(f); }
+        }
+        if (Focused(CT_Document) is { } fd) return fd;
+        if (uia.ElementFromHandle(new IntPtr(hwnd), out var root) != 0 || root == null) return null;
+        IntPtr cond = IntPtr.Zero; IUIAutomationElementArray? all = null;
+        var docs = new List<ControlIdentity>();
+        int documentsSeen = 0;
+        try
+        {
+            if (uia.CreateTrueCondition(out cond) != 0 || cond == IntPtr.Zero) return null;
+            if (root.FindAll(TreeScope.TreeScope_Descendants, cond, out all) != 0 || all == null) return null;
+            all.get_Length(out int n);
+            for (int i = 0; i < Math.Min(n, 6000); i++)
+            {
+                if (all.GetElement(i, out var el) != 0 || el == null) continue;
+                try
+                {
+                    if (Prop(el, P_ControlType) is not CT_Document) continue;
+                    documentsSeen++;
+                    if (EditorOf(el, hwnd, pid, CT_Document) is { } d) docs.Add(d);
+                }
+                finally { Marshal.ReleaseComObject(el); }
+            }
+        }
+        finally
+        {
+            if (all != null) Marshal.ReleaseComObject(all);
+            if (cond != IntPtr.Zero) Marshal.Release(cond);
+            Marshal.ReleaseComObject(root);
+        }
+        if (docs.Count == 1) return docs[0];
+        if (docs.Count > 1) return null;   // several documents: never guessed
+        // No document at all (a plain text-box application): the focused edit field of this window, if any.
+        return documentsSeen == 0 ? Focused(CT_Edit) : null;
+    });
+
+    public (bool Ok, string Text) ReadEditorText(long hwnd, int[] runtimeId) => WithUia(uia =>
+    {
+        (bool, string) Read(IUIAutomationElement el)
+        {
+            var full = (IUiaElementFull)el;
+            if (full.GetCurrentPattern(UIA_ValuePatternId, out var vpat) == 0 && vpat != null)
+            {
+                try { if (((IUiaValuePattern)vpat).get_CurrentValue(out var v) == 0) return (true, v ?? ""); }
+                finally { Marshal.ReleaseComObject(vpat); }
+            }
+            var tp = TextPatternOf(el);
+            if (tp == null) return (false, "");
+            try
+            {
+                if (tp.get_DocumentRange(out var doc) != 0 || doc == null) return (false, "");
+                try { return doc.GetText(1_000_000, out var t) == 0 ? (true, t ?? "") : (false, ""); }
+                finally { Marshal.ReleaseComObject(doc); }
+            }
+            finally { Marshal.ReleaseComObject(tp); }
+        }
+        // Fast path: the editor holds the keyboard focus (as it does while typing); otherwise found by its runtime id under the window.
+        if (uia.GetFocusedElement(out var f) == 0 && f != null)
+        {
+            try { if (RuntimeId(f) is { } rid && rid.AsSpan().SequenceEqual(runtimeId)) return Read(f); }
+            finally { Marshal.ReleaseComObject(f); }
+        }
+        var r = WithElement(uia, hwnd, runtimeId, el => ((bool, string)?)Read(el));
+        return r ?? (false, "");
+    });
+
     private const int UIA_TextPatternId = 10014;
     private static IUiaTextPattern? TextPatternOf(IUIAutomationElement el)
     {
@@ -213,7 +323,7 @@ public sealed class Win32DesktopInputPlatform : IDesktopInputPlatform
             if (uia.CreateTrueCondition(out cond) != 0 || cond == IntPtr.Zero) return default!;
             if (root.FindAll(TreeScope.TreeScope_Descendants, cond, out all) != 0 || all == null) return default!;
             all.get_Length(out int n);
-            for (int i = 0; i < Math.Min(n, 2000); i++)
+            for (int i = 0; i < Math.Min(n, 6000); i++)
             {
                 if (all.GetElement(i, out var el) != 0 || el == null) continue;
                 try { if (RuntimeId(el) is { } rid && rid.AsSpan().SequenceEqual(runtimeId)) return f(el); }

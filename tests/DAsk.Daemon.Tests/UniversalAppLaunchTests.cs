@@ -81,7 +81,7 @@ public class UniversalAppLaunchTests
         public bool Stopped;
         private readonly string _db = Path.Combine(Path.GetTempPath(), $"dask-ulaunch-{Guid.NewGuid():N}.db");
 
-        public Rig(bool catalog = true, int waitMs = 800, bool webSearch = false)
+        public Rig(bool catalog = true, int waitMs = 800, bool webSearch = false, bool online = true)
         {
             Recorder = new SqliteEvidenceRecorder(NullLogger<SqliteEvidenceRecorder>.Instance, _db);
             Policy = new ActionPolicyEngine(NullLogger<ActionPolicyEngine>.Instance, Recorder, Windows);
@@ -93,7 +93,7 @@ public class UniversalAppLaunchTests
                 new AppLaunchOptions
                 {
                     Enabled = true, WaitForWindowMs = waitMs, WaitForAppWindowMs = waitMs, PollMs = 20, ApprovalTtl = TimeSpan.FromSeconds(10),
-                    SystemDirectoryOverride = Path.GetTempPath(), Catalog = catalog ? new InstalledAppCatalog(Source) : null, Activator = Activator, WebSearchAllowed = webSearch,
+                    SystemDirectoryOverride = Path.GetTempPath(), Catalog = catalog ? new InstalledAppCatalog(Source) : null, Activator = Activator, WebSearchAllowed = webSearch, IsOnline = () => online,
                 }, Registry);
         }
 
@@ -360,9 +360,12 @@ public class UniversalAppLaunchTests
         using var rig = new Rig();   // the product default: web search switched off (offline-first)
         await rig.Recorder.InitializeAsync();
         var res = await rig.Call(AppLaunchRequestService.Launch, new { app = "chrome", search = "weather" });
-        Assert.Equal("offline_mode", res.Error!.Code);
-        Assert.Contains("needs internet access", res.Error.Message);
-        Assert.Contains("open chrome itself", res.Error.Message);
+        // A D-ASK SETTING, said as such: never "offline" (the computer's network is a different question, 2026-11-16).
+        Assert.Equal("web_search_disabled", res.Error!.Code);
+        Assert.Contains("not a problem with your internet connection", res.Error.Message);
+        Assert.Contains("DASK_AgentHost__WebSearch=true", res.Error.Message);
+        Assert.DoesNotContain("offline mode", res.Error.Message);
+        Assert.Contains("open chrome by itself", res.Error.Message);
         Assert.Empty(rig.Delivered);              // no approval card
         Assert.Empty(rig.Activator.Started);      // nothing started
         Assert.Equal(0, rig.Source.Calls);        // not even looked up
@@ -370,6 +373,71 @@ public class UniversalAppLaunchTests
         rig.Activator.OnStart = _ => rig.Windows.Windows.Add(Phase7B1bTests.W(5800, 4100, "chrome.exe", "New Tab - Google Chrome"));
         var (open, _) = await LaunchWith(rig, new { app = "chrome" });
         Assert.Equal("ok", open.Status);
+    }
+
+    [Fact]
+    public async Task Search_InAnAlreadyOpenBrowserKeptBehind_IsConfirmedByItsTitleChangingToTheSearch()
+    {
+        using var rig = new Rig(waitMs: 4000, webSearch: true);
+        await rig.Recorder.InitializeAsync();
+        // The user's Chrome (hwnd 900, NOT in front) gets the search as a new tab: its title changes; no new window appears.
+        rig.Activator.OnStart = _ => { int i = rig.Windows.Windows.FindIndex(w => w.Hwnd == 900); rig.Windows.Windows[i] = rig.Windows.Windows[i] with { Title = "weather - Google Search - Google Chrome" }; };
+        var (res, _) = await LaunchWith(rig, new { app = "chrome", search = "weather" });
+        Assert.Equal("ok", res.Status);
+        Assert.False(JsonSerializer.SerializeToElement(res.Result).GetProperty("newWindow").GetBoolean());
+        Assert.Null(rig.Registry.For("t1"));   // an existing window is never recorded as one D-ASK opened (no typing into it)
+    }
+
+    [Fact]
+    public async Task Search_AWindowThatAlreadyShowedTheSearch_IsNotProofOfThisLaunch()
+    {
+        using var rig = new Rig(waitMs: 4000, webSearch: true);
+        await rig.Recorder.InitializeAsync();
+        int i = rig.Windows.Windows.FindIndex(w => w.Hwnd == 900);
+        rig.Windows.Windows[i] = rig.Windows.Windows[i] with { Title = "weather - Google Search - Google Chrome" };   // before the start
+        var (res, _) = await LaunchWith(rig, new { app = "chrome", search = "weather" });
+        Assert.Equal("launch_unverified", res.Error!.Code);
+    }
+
+    [Fact]
+    public async Task WebSearchAllowed_ButNoNetwork_IsReportedAsTheNetwork_NotTheSetting()
+    {
+        using var rig = new Rig(webSearch: true, online: false);
+        await rig.Recorder.InitializeAsync();
+        var res = await rig.Call(AppLaunchRequestService.Launch, new { app = "chrome", search = "weather" });
+        Assert.Equal("no_network", res.Error!.Code);
+        Assert.Contains("Windows reports no network connection", res.Error.Message);
+        Assert.Empty(rig.Delivered);
+        Assert.Empty(rig.Activator.Started);
+    }
+
+    [Fact]
+    public async Task NewDocument_OpensWordWithItsBlankDocumentSwitch_AndRecordsTheWindowForTyping()
+    {
+        using var rig = new Rig();
+        await rig.Recorder.InitializeAsync();
+        rig.Activator.OnStart = _ => rig.Windows.Windows.Add(Phase7B1bTests.W(7100, 4200, "WINWORD.EXE", "Document1 - Word"));
+        var (res, card) = await LaunchWith(rig, new { app = "Word", newDocument = true });
+        Assert.Equal("ok", res.Status);
+        Assert.Equal("/w", rig.Activator.Last!.Arguments);   // the daemon's fixed switch, never agent text
+        Assert.Equal("Open Word ready for typing", card!.ActionParameters["operation"]);
+        Assert.Equal("a new blank document", card.ActionParameters["opens"]);
+        Assert.NotNull(rig.Registry.For("t1"));               // the typing step may target exactly this window
+    }
+
+    [Fact]
+    public async Task NewDocument_IsRefusedForBrowsers_AndMustBeTrue()
+    {
+        using var rig = new Rig();
+        await rig.Recorder.InitializeAsync();
+        var res = await rig.Call(AppLaunchRequestService.Launch, new { app = "chrome", newDocument = true });
+        Assert.Equal("invalid_args", res.Error!.Code);
+        Assert.Contains("web browser", res.Error.Message);
+        var bad = await rig.Call(AppLaunchRequestService.Launch, new { app = "Word", newDocument = false });
+        Assert.Equal("invalid_args", bad.Error!.Code);
+        var both = await rig.Call(AppLaunchRequestService.Launch, new { app = "chrome", newDocument = true, search = "x" });
+        Assert.Equal("invalid_args", both.Error!.Code);
+        Assert.Empty(rig.Activator.Started);
     }
 
     [Fact]
