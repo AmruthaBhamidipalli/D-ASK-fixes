@@ -26,7 +26,15 @@ export async function POST(request: NextRequest) {
   const denied = requireAuth(request, "task");
   if (denied) return denied;
   try {
-    const body = (await request.json()) as CreateTaskRequest;
+    let body: CreateTaskRequest;
+    try {
+      body = (await request.json()) as CreateTaskRequest;
+    } catch {
+      return NextResponse.json(
+        { error: "request body must be valid JSON" },
+        { status: 400 }
+      );
+    }
 
     if (!body.objective?.trim()) {
       return NextResponse.json(
