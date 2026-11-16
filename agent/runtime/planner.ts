@@ -255,6 +255,22 @@ export class Planner {
       });
     }
 
+    // A small model sometimes repeats one step many times (seen: system.time x8 for "send an email"). Reject such a plan so the
+    // repair round can ask for a corrected one. Tools that handle repeats themselves (they define identicalStepsAllowed) are skipped.
+    const MAX_IDENTICAL_STEPS = 3;
+    const copies = new Map<string, { tool: string; n: number }>();
+    for (const s of steps) {
+      const key = `${s.tool}|${canonicalJson(s.input)}`;
+      const c = copies.get(key) ?? { tool: s.tool, n: 0 };
+      c.n++;
+      copies.set(key, c);
+    }
+    for (const c of copies.values()) {
+      if (c.n > MAX_IDENTICAL_STEPS && !this.registry.get(c.tool)?.requestCheck?.identicalStepsAllowed) {
+        errors.push(`${c.tool} is planned ${c.n} times with identical input; plan each step once. If no listed tool can serve the request, return intent "unsupported" with steps: [].`);
+      }
+    }
+
     if (errors.length) return { ok: false, errors: errors.slice(0, 10) };
     const objective = req.objective;
     const allowance = objective === undefined ? undefined : (tool: string, input: Record<string, unknown>) => {
