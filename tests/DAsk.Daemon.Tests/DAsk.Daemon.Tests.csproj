@@ -33,7 +33,7 @@
     <Reference Include="DAsk.Protocol">
       <HintPath>..\..\src\DAsk.Protocol\bin\Debug\net8.0\DAsk.Protocol.dll</HintPath>
     </Reference>
-    <None Include="..\..\src\DAsk.Daemon\bin\Debug\net8.0\e_sqlite3.dll">
+    <None Include="..\..\src\DAsk.Daemon\bin\Debug\net8.0\runtimes\win-x64\native\e_sqlite3.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>e_sqlite3.dll</Link>
     </None>
