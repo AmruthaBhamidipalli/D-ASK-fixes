@@ -11,6 +11,27 @@ interface DevicePanelProps {
   isExecuting?: boolean;
 }
 
+type DevicePayload = { targetApp?: string; searchQuery?: string; deviceIp?: string; pairPort?: string; pairCode?: string; newDeviceName?: string; newDeviceOs?: "Android" | "iOS" };
+
+/** One plain sentence for what a button will do, or null for an action this panel does not run. */
+function describeDeviceAction(action: string, payload: DevicePayload | undefined, phone: string): string | null {
+  switch (action) {
+    case "lock": return `Turn the screen of ${phone} off (lock it), once.`;
+    case "unlock": return `Wake the screen of ${phone}, once. No PIN or pattern is entered.`;
+    case "go_home":
+    case "home": return `Press the Home button on ${phone}, once.`;
+    case "volume_up": return `Press Volume Up on ${phone}, once.`;
+    case "volume_down": return `Press Volume Down on ${phone}, once.`;
+    case "launch_app":
+    case "launch": return `Open ${(payload?.targetApp ?? "an app").toUpperCase()} on ${phone}, once.`;
+    case "take_screenshot":
+    case "screenshot": return `Take a screenshot of ${phone}. It is saved in the phone's Gallery (Pictures/Screenshots) and shown in this panel.`;
+    case "enable_tcpip": return `Switch ${phone} to Wi-Fi debugging on port 5555 (adb tcpip 5555), once.`;
+    case "pair_bluetooth": return `Connect this PC to ${payload?.deviceIp ?? "the phone"} over Wi-Fi (adb connect), once.`;
+    default: return null;
+  }
+}
+
 export default function DevicePanel({
   device,
   hasPhysicalDevice = false,
@@ -30,6 +51,10 @@ export default function DevicePanel({
   const [newDevName, setNewDevName] = useState("iPhone 15 Pro");
   const [newDevOs, setNewDevOs] = useState<"Android" | "iOS">("iOS");
   const [savedPin, setSavedPin] = useState("");
+  // Every panel button first asks here; the action runs only after APPROVE. (A confirmation shown by this panel: the daemon does not
+  // enforce it, unlike the approval cards for requests typed into the console.)
+  const [pending, setPending] = useState<{ action: string; payload?: DevicePayload } | null>(null);
+  const [showShot, setShowShot] = useState(false);
 
   // Poll list of all devices & diagnostics
   useEffect(() => {
@@ -71,7 +96,7 @@ export default function DevicePanel({
   const connectedDevs = devicesList.filter((d) => d.status === "CONNECTED");
   const activeDev = connectedDevs.find((d) => d.id === selectedDeviceId) || connectedDevs[0] || null;
 
-  const dispatchAction = (action: string, payload?: { targetApp?: string; searchQuery?: string; deviceIp?: string; pairPort?: string; pairCode?: string; newDeviceName?: string; newDeviceOs?: "Android" | "iOS" }) => {
+  const runAction = (action: string, payload?: DevicePayload) => {
     onControlDevice(action, {
       ...payload,
       targetDeviceId: broadcastAll ? undefined : selectedDeviceId,
@@ -80,10 +105,37 @@ export default function DevicePanel({
     });
   };
 
+  // A button press asks first; an action this panel does not know goes straight through and is answered with an error.
+  const dispatchAction = (action: string, payload?: DevicePayload) => {
+    if (describeDeviceAction(action, payload, "x") === null) { runAction(action, payload); return; }
+    setPending({ action, payload });
+  };
+
+  const approvalCard = pending ? (
+    <div className="device-approval-backdrop" data-hud-interactive>
+      <div className="device-approval-card" role="alertdialog" aria-label="Approval required">
+        <div className="device-approval-title">APPROVAL REQUIRED: ONE ACTION</div>
+        <div className="device-approval-text">{describeDeviceAction(pending.action, pending.payload, activeDev?.name ?? "the phone")}</div>
+        <div className="device-approval-note">Nothing runs until you press APPROVE. DENY cancels.</div>
+        <div className="device-approval-buttons">
+          <button type="button" className="dev-btn device-approve" onClick={() => { const p = pending; setPending(null); runAction(p.action, p.payload); }}>APPROVE</button>
+          <button type="button" className="dev-btn device-deny" onClick={() => setPending(null)}>DENY</button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
+  const shotOverlay = showShot && activeDev?.screenshotUrl ? (
+    <div className="device-shot-backdrop" data-hud-interactive onClick={() => setShowShot(false)}>
+      <img className="device-shot-full" src={activeDev.screenshotUrl} alt="Phone screenshot, full size" />
+      <div className="device-shot-hint">CLICK ANYWHERE TO CLOSE</div>
+    </div>
+  ) : null;
+
   if (!activeDev) {
     return (
       <>
-        <aside className="device-hud-panel" aria-label="Connected Devices HUD Panel" data-hud-interactive>
+        {approvalCard}{shotOverlay}<aside className="device-hud-panel" aria-label="Connected Devices HUD Panel" data-hud-interactive>
           <div className="device-header">
             <div className="device-title-wrap">
               <span className="device-indicator" data-physical={false} />
@@ -283,7 +335,7 @@ export default function DevicePanel({
 
   return (
     <>
-      <aside className="device-hud-panel" aria-label="Connected Devices HUD Panel" data-hud-interactive>
+      {approvalCard}{shotOverlay}<aside className="device-hud-panel" aria-label="Connected Devices HUD Panel" data-hud-interactive>
         {/* HUD Top Bar & Multi-Device Selector */}
         <div className="device-header">
           <div className="device-title-wrap">
@@ -399,15 +451,17 @@ export default function DevicePanel({
         </div>
 
         {/* Live Device Screen Display / Real Screenshot Preview */}
-        <div className="device-screen-preview">
+        <div className={`device-screen-preview${activeDev.screenshotUrl ? " has-shot" : ""}`}>
           <div className="screen-frame">
             <div className="screen-notch" />
             <div className="screen-content" data-app={currentAppUpper}>
               {activeDev.screenshotUrl ? (
                 <img
                   src={activeDev.screenshotUrl}
-                  alt="Captured Device Screen"
-                  style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                  alt="Captured Device Screen (click to enlarge)"
+                  title="Click to enlarge"
+                  onClick={() => setShowShot(true)}
+                  style={{ width: "100%", height: "100%", objectFit: "contain", cursor: "zoom-in" }}
                 />
               ) : isLocked ? (
                 <div className="screen-locked">
