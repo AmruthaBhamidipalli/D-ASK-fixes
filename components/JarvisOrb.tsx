@@ -949,11 +949,17 @@ export default function JarvisOrb() {
       setVoiceState("idle");
       setAudioLevel(0);
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      // Disarming in the middle of an utterance (the stop above) must not leave "recording" set: with it still true the next arming
+      // never started a recording, so the second voice command after ARM VOICE was never captured. Also release the audio context.
+      isRecordingRef.current = false;
+      void audioContextRef.current?.close().catch(() => undefined);
+      audioContextRef.current = null;
       return;
     }
 
     // The user is about to speak: D-ASK stops talking (interruption).
     speechFx.stop();
+    isRecordingRef.current = false;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       micStreamRef.current = stream;
