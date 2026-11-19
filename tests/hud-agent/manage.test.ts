@@ -86,11 +86,15 @@ async function main() {
   // V1: every request the microphone submits is first recorded in voiceCommandRef as EXACTLY the text it submits (uppercased, as askAssistant
   // records it in the history), so V2 speaks a result only for that voice request. Structural: inside the STT handler, every runCommand(X) is
   // immediately preceded by voiceCommandRef.current = X.toUpperCase() with the same X, and submission happens only for a parsed command.
-  const sttBlock = orb.slice(orb.indexOf("fetch('/api/stt'"), orb.indexOf("STT Error"));
+  // 2026-11-17: the microphone code moved to lib/micSession.ts, so this block now starts at the page's POST of the WAV to /api/stt and runs to
+  // the end of the transcript handler (its "too short to be a request" branch). An empty block (a marker that vanished) fails the check below.
+  const sttStart = orb.indexOf('fetch("/api/stt"');
+  const sttEnd = sttStart < 0 ? -1 : orb.indexOf("too short to be a request", sttStart);
+  const sttBlock = sttStart < 0 || sttEnd < 0 ? "" : orb.slice(sttStart, sttEnd);
   const submits = [...sttBlock.matchAll(/runCommand\(/g)].length;
   const paired = [...sttBlock.matchAll(/voiceCommandRef\.current = ([\w.]+)\.toUpperCase\(\);\s*void runCommand\(([\w.]+)\)/g)];
   check(sttBlock.length > 0 && submits >= 1 && paired.length === submits && paired.every((m) => m[1] === m[2]) &&
-    /const action = parseVoiceTranscript\(transcript\)/.test(sttBlock) && /action\.kind === "command"\)\s*\{\s*voiceCommandRef\.current = action\.text\.toUpperCase\(\);\s*void runCommand\(action\.text\)/.test(sttBlock) &&
+    /const action = parseVoiceTranscript\(transcript\)/.test(sttBlock) && /action\.kind === "command"\)\s*\{\s*(?:\/\/[^\n]*\s*)*voiceCommandRef\.current = action\.text\.toUpperCase\(\);\s*void runCommand\(action\.text\)/.test(sttBlock) &&
     /void askAssistant\(rawCommand\.trim\(\)\)/.test(orb) && /command: prompt\.toUpperCase\(\)/.test(orb),
     "V1a every microphone submission records exactly the text it submits (one parsed path for plain and wake-word speech)", { submits, paired: paired.map((m) => m[0]) });
   // Behavioural, for both microphone paths: the recorded key equals the history key askAssistant will write (trim, then uppercase);

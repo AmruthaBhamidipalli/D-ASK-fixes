@@ -29,7 +29,47 @@ static SHOT: Mutex<Option<(String, Vec<u8>, u128)>> = Mutex::new(None);
 
 /// What the page shows before the first scan has finished (and the old fixed reply).
 fn empty_reply() -> String {
-    json!({ "success": true, "devices": [], "activeDevice": null, "totalConnected": 0, "hasPhysicalDevice": false }).to_string()
+    // Nothing has been scanned yet, so no cause is claimed (an empty troubleshootStep shows no warning).
+    let mut diagnostics = diagnostics_json(true, &adb_path().to_string_lossy(), &[]);
+    diagnostics["troubleshootStep"] = json!("");
+    json!({
+        "success": true, "devices": [], "activeDevice": null, "totalConnected": 0, "hasPhysicalDevice": false,
+        "diagnostics": diagnostics,
+    }).to_string()
+}
+
+/// The page's panel already shows `diagnostics.troubleshootStep` ("DIAGNOSTIC: ...") when it is not empty. These are the fields of the
+/// page's HardwareDiagnostics type; the one that matters is the sentence that names the cause.
+fn diagnostics_json(adb_ok: bool, adb_path: &str, listed: &[Listed]) -> Value {
+    let count = |state: &str| listed.iter().filter(|d| d.state == state).count();
+    json!({
+        "adbRunning": adb_ok,
+        "adbPath": adb_path,
+        "devicesFoundCount": listed.len(),
+        "usbAttached": listed.iter().any(|d| !d.serial.contains(':')),
+        "wirelessAttached": listed.iter().any(|d| d.serial.contains(':')),
+        "unauthorizedCount": count("unauthorized"),
+        "iphoneDetected": false,
+        "troubleshootStep": troubleshoot(adb_ok, listed),
+    })
+}
+
+/// One sentence naming why no phone is usable, or "" when at least one phone is ready (or while the very first scan is still running).
+fn troubleshoot(adb_ok: bool, listed: &[Listed]) -> String {
+    if !adb_ok {
+        return "The HUD cannot start adb. Start D-ASK with Start-D-ASK.cmd (it sets where adb is), and check that adb.exe exists.".into();
+    }
+    if listed.iter().any(|d| d.state == "device") { return String::new(); }
+    if listed.iter().any(|d| d.state == "unauthorized") {
+        return "A phone is connected but has not allowed this PC. Unlock it and tap Allow on 'Allow USB debugging?' (tick Always allow). No prompt? In Developer options tap 'Revoke USB debugging authorizations', then unplug and replug.".into();
+    }
+    if listed.iter().any(|d| d.state == "offline") {
+        return "adb lists the phone as offline. Unplug and replug it; if that does not help, run Check-Phone.cmd -RestartAdb.".into();
+    }
+    if listed.is_empty() {
+        return "adb sees no phone. USB: use a data cable, set USB mode to File transfer and turn on USB debugging. Wi-Fi: Wireless debugging must be on and 'adb connect IP:PORT' must have said connected (the port changes each time it is switched on). Run Check-Phone.cmd to find out which.".into();
+    }
+    "adb lists a device in a state this panel does not recognise. Run Check-Phone.cmd.".into()
 }
 
 /// The latest scan result. The first call starts the background scanner.
@@ -67,14 +107,15 @@ fn adb_path() -> PathBuf {
 fn run_adb(adb: &Path, args: &[&str], limit: Duration) -> Option<String> {
     let tmp = std::env::temp_dir().join(format!("dask-adb-{}.txt", uuid::Uuid::new_v4()));
     let out = std::fs::File::create(&tmp).ok()?;
-    let mut child = Command::new(adb)
+    let spawned = Command::new(adb)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .ok()?;
+        .spawn();
+    // adb could not be started (wrong path, not installed): remove the empty output file, or one is left behind every scan.
+    let mut child = match spawned { Ok(c) => c, Err(_) => { let _ = std::fs::remove_file(&tmp); return None; } };
     let started = Instant::now();
     let finished = loop {
         match child.try_wait() {
@@ -157,7 +198,9 @@ fn as_disconnected(devices: &[Value]) -> Vec<Value> {
 /// simply vanishing (the page keeps its old list when it receives an empty one).
 fn scan(last_seen: &mut Vec<Value>) -> String {
     let adb = adb_path();
-    let listed = run_adb(&adb, &["devices", "-l"], Duration::from_secs(8)).map(|t| parse_devices(&t)).unwrap_or_default();
+    let listed_text = run_adb(&adb, &["devices", "-l"], Duration::from_secs(8));
+    let adb_ok = listed_text.is_some();   // false: adb could not be started, or did not answer in time
+    let listed = listed_text.map(|t| parse_devices(&t)).unwrap_or_default();
     let mut devices: Vec<Value> = Vec::new();
     for d in &listed {
         match d.state.as_str() {
@@ -193,6 +236,7 @@ fn scan(last_seen: &mut Vec<Value>) -> String {
         "activeDevice": connected.first().map(|d| (*d).clone()),
         "totalConnected": connected.len(),
         "hasPhysicalDevice": false,
+        "diagnostics": diagnostics_json(adb_ok, &adb.to_string_lossy(), &listed),
     }).to_string()
 }
 
@@ -201,9 +245,14 @@ fn scan(last_seen: &mut Vec<Value>) -> String {
 /// The only actions the panel may run. Each maps to a fixed adb command below; the page never supplies a command line, a
 /// package name or a path. (A click in the panel is the user's own action; there is no separate approval card here, unlike
 /// requests typed into the console, which the daemon approves and audits.)
+///
+/// "pair_bluetooth" is replaced by two new actions:
+///   "pair_discover"  – runs `adb mdns services` and returns the pairing / connect endpoints it finds (no phone touched, read-only).
+///   "pair_connect"   – validates the 6-digit code and the pairing address, runs `adb pair`, polls for the connect endpoint,
+///                      then runs `adb connect` and confirms with `adb devices -l`. Never stores or logs the code.
 const ACTIONS: &[&str] = &[
     "lock", "unlock", "go_home", "home", "volume_up", "volume_down", "launch_app", "launch", "take_screenshot", "screenshot",
-    "enable_tcpip", "pair_bluetooth",
+    "enable_tcpip", "pair_discover", "pair_connect",
 ];
 
 /// Apps the buttons may open: (shell command, package to confirm in the foreground). A fixed list.
@@ -343,6 +392,64 @@ fn fail(status: u16, message: &str) -> (u16, String) {
     (status, json!({ "success": false, "error": message }).to_string())
 }
 
+// ── mDNS service record helpers ──────────────────────────────────────────────────────────────────────────────────────
+
+/// One line from `adb mdns services`:  `<name>\t_adb-tls-pairing._tcp\t<ip:port>`  or `..._adb-tls-connect._tcp...`.
+/// Returns `(pairing_endpoints, connect_endpoints)` both as `ip:port` strings.
+fn parse_mdns(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut pair_eps: Vec<String> = Vec::new();
+    let mut conn_eps: Vec<String> = Vec::new();
+    for line in text.lines() {
+        // Columns are tab-separated in adb's output; any run of whitespace is accepted so a different adb build still parses.
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 3 { continue; }
+        let svc = cols[cols.len() - 2];
+        let ep = cols[cols.len() - 1];
+        if !valid_host_port(ep) { continue; }   // skip malformed (headers, hostnames)
+        if svc.contains("_adb-tls-pairing._tcp") {
+            pair_eps.push(ep.to_string());
+        } else if svc.contains("_adb-tls-connect._tcp") {
+            conn_eps.push(ep.to_string());
+        }
+    }
+    (pair_eps, conn_eps)
+}
+
+/// What `pair_connect` needs from the request, checked BEFORE adb is touched: the 6-digit code (trimmed) and the pairing address if the
+/// caller gave one (an empty string means "discover it"). Err = (HTTP status, message).
+fn pair_inputs(v: &Value) -> Result<(String, String), (u16, &'static str)> {
+    let code = v["pairCode"].as_str().unwrap_or("").trim().to_string();
+    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+        return Err((400, "THE PAIRING CODE MUST BE EXACTLY 6 DIGITS (0-9). CHECK THE CODE SHOWN ON THE PHONE."));
+    }
+    let supplied = v["deviceIp"].as_str().unwrap_or("").trim().to_string();
+    if !supplied.is_empty() && !valid_host_port(&supplied) {
+        return Err((400, "THE PAIRING ADDRESS IS NOT A VALID IP:PORT. USE THE ADDRESS SHOWN IN THE 'PAIR DEVICE WITH PAIRING CODE' DIALOG, NOT THE MAIN WIRELESS DEBUGGING ADDRESS."));
+    }
+    Ok((code, supplied))
+}
+
+/// True when the address the caller typed is a phone's CONNECT address (the main Wireless debugging screen), which can never be paired.
+fn is_connect_address(addr: &str, pair_eps: &[String], conn_eps: &[String]) -> bool {
+    conn_eps.iter().any(|e| e == addr) && !pair_eps.iter().any(|e| e == addr)
+}
+
+/// One sentence for the HUD history line after "FIND PHONE" (the page shows `result` as is; without it the HUD prints a generic line).
+fn describe_discovery(pair_eps: &[String], conn_eps: &[String]) -> String {
+    if !pair_eps.is_empty() {
+        format!("PAIRING DIALOG FOUND AT {}. TYPE THE 6-DIGIT CODE SHOWN ON THE PHONE AND PRESS PAIR AND CONNECT.", pair_eps.join(", "))
+    } else if !conn_eps.is_empty() {
+        format!("A PHONE IS ADVERTISING WIRELESS DEBUGGING AT {} BUT NO PAIRING DIALOG IS OPEN. TO PAIR IT, OPEN 'PAIR DEVICE WITH PAIRING CODE' ON THE PHONE.", conn_eps.join(", "))
+    } else {
+        "NO PHONE FOUND ON THE NETWORK. TURN ON WIRELESS DEBUGGING, OPEN 'PAIR DEVICE WITH PAIRING CODE' ON THE PHONE AND KEEP IT OPEN. BOTH DEVICES MUST BE ON THE SAME WI-FI.".to_string()
+    }
+}
+
+/// Extract just the IP part from "ip:port".
+fn ip_of(ep: &str) -> &str {
+    ep.split(':').next().unwrap_or(ep)
+}
+
 /// POST /api/devices from the panel's buttons. Returns (HTTP status, JSON body). Blocking: call it off the UI thread.
 pub fn control(body: &[u8]) -> (u16, String) {
     let Ok(v) = serde_json::from_slice::<Value>(body) else { return fail(400, "BAD REQUEST: THE BODY IS NOT JSON") };
@@ -352,16 +459,107 @@ pub fn control(body: &[u8]) -> (u16, String) {
     }
     let adb = adb_path();
 
-    // Wireless connect: adb connect <ip:port>, exactly as typed in the setup window, after checking its shape.
-    if action == "pair_bluetooth" {
-        let target = v["deviceIp"].as_str().unwrap_or("").trim().to_string();
-        if !valid_host_port(&target) { return fail(400, "ENTER THE PHONE'S WI-FI ADDRESS AS IP:PORT, E.G. 192.168.1.5:5555"); }
-        let out = run_adb(&adb, &["connect", &target], Duration::from_secs(12)).unwrap_or_default();
-        let low = out.to_lowercase();
-        return if low.contains("connected to") && !low.contains("failed") && !low.contains("cannot") {
-            (200, json!({ "success": true, "result": format!("CONNECTED TO {target} OVER WI-FI") }).to_string())
+    // ── pair_discover: scan adb mdns services and return what it finds (no adb pair / connect yet) ──────────────────
+    if action == "pair_discover" {
+        let raw = run_adb(&adb, &["mdns", "services"], Duration::from_secs(8)).unwrap_or_default();
+        let (pair_eps, conn_eps) = parse_mdns(&raw);
+        let result = describe_discovery(&pair_eps, &conn_eps);
+        return (200, json!({
+            "success": true,
+            "result": result,
+            "pairingEndpoints": pair_eps,
+            "connectEndpoints": conn_eps,
+            "rawOutput": raw.trim(),
+        }).to_string());
+    }
+
+    // ── pair_connect: validate code + address, pair, then connect ────────────────────────────────────────────────────
+    if action == "pair_connect" {
+        // 1. Validate the 6-digit pairing code and the (optional) pairing address. The code is used only as an argument and is never
+        //    logged or stored. All of this happens before adb is touched.
+        let (pair_code, supplied) = match pair_inputs(&v) { Ok(x) => x, Err((status, message)) => return fail(status, message) };
+
+        // 2. Determine the pairing endpoint (ip:pairport). Not supplied: discover it; never guess when there are several.
+        let raw = run_adb(&adb, &["mdns", "services"], Duration::from_secs(8)).unwrap_or_default();
+        let (pair_eps, conn_eps) = parse_mdns(&raw);
+        let pair_ep: String = if !supplied.is_empty() {
+            if is_connect_address(&supplied, &pair_eps, &conn_eps) {
+                return fail(409, &format!("{} IS THE CONNECT ADDRESS (THE MAIN WIRELESS DEBUGGING SCREEN). PAIRING NEEDS THE ADDRESS SHOWN INSIDE THE 'PAIR DEVICE WITH PAIRING CODE' DIALOG, WHICH IS A DIFFERENT PORT.", supplied));
+            }
+            supplied
         } else {
-            fail(502, &format!("COULD NOT CONNECT TO {target}: {}", out.trim().to_uppercase()))
+            match pair_eps.len() {
+                0 => return fail(404, "NO WIRELESS DEBUGGING PAIRING DIALOG FOUND. OPEN DEVELOPER OPTIONS > WIRELESS DEBUGGING > 'PAIR DEVICE WITH PAIRING CODE' ON THE PHONE FIRST AND KEEP IT OPEN, THEN TRY AGAIN."),
+                1 => pair_eps.into_iter().next().unwrap(),
+                _ => return fail(409, &format!("MORE THAN ONE PHONE IS SHOWING A PAIRING DIALOG ({}). CLOSE THE OTHERS SO THE RIGHT ONE IS CHOSEN.", pair_eps.join(", "))),
+            }
+        };
+
+        // 3. Run `adb pair <ip:pairport> <code>`.  The code is passed as a separate argument so it never touches a shell.
+        let pair_out = match run_adb(&adb, &["pair", &pair_ep, &pair_code], Duration::from_secs(25)) {
+            Some(o) => o,
+            None => return fail(504, "THE PAIRING COMMAND DID NOT FINISH IN TIME. MAKE SURE THE PHONE'S 'PAIR WITH PAIRING CODE' DIALOG IS STILL OPEN AND TRY AGAIN."),
+        };
+        // Check adb's real output.
+        if !pair_out.to_lowercase().contains("successfully paired") {
+            // Detect the common mistake: the user gave the main wireless-debugging address (connect port) instead of the
+            // pairing-dialog address.  The pairing endpoint shows a different port each time; the connect endpoint is
+            // persistent and usually 5-digit.  `adb pair` on the connect port produces "failed to pair" or "error".
+            let hint = if pair_out.to_lowercase().contains("failed") || pair_out.to_lowercase().contains("error") {
+                " (HINT: IF YOU TYPED AN IP:PORT YOURSELF, MAKE SURE IT IS FROM THE 'PAIR DEVICE WITH PAIRING CODE' DIALOG, NOT THE MAIN WIRELESS DEBUGGING SCREEN — THOSE ARE DIFFERENT PORTS.)"
+            } else { "" };
+            return fail(502, &format!("PAIRING FAILED: {}{}", pair_out.trim().to_uppercase(), hint));
+        }
+
+        // 4. Poll `adb mdns services` for up to ~10 s for a _adb-tls-connect._tcp endpoint on the same IP.
+        let pair_ip = ip_of(&pair_ep).to_string();
+        let connect_ep: Option<String> = {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut found = None;
+            while Instant::now() < deadline {
+                let raw = run_adb(&adb, &["mdns", "services"], Duration::from_secs(5)).unwrap_or_default();
+                let (_, conn_eps) = parse_mdns(&raw);
+                if let Some(ep) = conn_eps.into_iter().find(|ep| ip_of(ep) == pair_ip) {
+                    found = Some(ep);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            found
+        };
+        let connect_ep = match connect_ep {
+            Some(ep) => ep,
+            None => return fail(504, &format!(
+                "PAIRED SUCCESSFULLY BUT COULD NOT FIND A WIRELESS DEBUGGING CONNECT ENDPOINT FOR {} WITHIN 10 SECONDS. \
+                 CHECK THAT WIRELESS DEBUGGING IS STILL ENABLED ON THE PHONE AND TRY THE BUTTON AGAIN.",
+                pair_ip
+            )),
+        };
+
+        // 5. Run `adb connect <ip:connectport>`.
+        let conn_out = run_adb(&adb, &["connect", &connect_ep], Duration::from_secs(12)).unwrap_or_default();
+        let conn_low = conn_out.to_lowercase();
+        if !conn_low.contains("connected to") || conn_low.contains("failed") || conn_low.contains("cannot") {
+            return fail(502, &format!("PAIRED BUT CONNECT FAILED: {}", conn_out.trim().to_uppercase()));
+        }
+
+        // 6. Confirm with `adb devices -l` that the serial shows up as "device".
+        let devs_out = run_adb(&adb, &["devices", "-l"], Duration::from_secs(8)).unwrap_or_default();
+        let confirmed = parse_devices(&devs_out).iter().any(|d| d.serial == connect_ep && d.state == "device");
+
+        // The code is now out of scope and will be dropped; it was never written to any log or file.
+        return if confirmed {
+            (200, json!({
+                "success": true,
+                "result": format!("PAIRED AND CONNECTED TO {} OVER WI-FI (CONFIRMED)", connect_ep),
+                "connectedTo": connect_ep,
+            }).to_string())
+        } else {
+            (200, json!({
+                "success": true,
+                "result": format!("PAIRED AND CONNECT COMMAND SENT TO {} — adb devices DID NOT YET CONFIRM IT AS 'device'. WAIT A MOMENT AND CHECK THE PANEL.", connect_ep),
+                "connectedTo": connect_ep,
+            }).to_string())
         };
     }
 
@@ -423,20 +621,127 @@ mod tests {
         assert!(!valid_host_port("192.168.1.5:5555;calc"));
     }
 
+    // ── pair_discover ──────────────────────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mdns_output_parses_pairing_and_connect_lines() {
+        // adb mdns services uses TAB-separated columns: name \t service-type \t ip:port
+        let raw = "adb-12345-pairing\t_adb-tls-pairing._tcp\t192.168.1.5:38765\nadb-12345-connect\t_adb-tls-connect._tcp\t192.168.1.5:5555\n";
+        let (pair_eps, conn_eps) = parse_mdns(raw);
+        assert_eq!(pair_eps, vec!["192.168.1.5:38765"]);
+        assert_eq!(conn_eps, vec!["192.168.1.5:5555"]);
+    }
+
+    #[test]
+    fn mdns_parser_ignores_lines_with_bad_endpoints() {
+        let raw = "adb-x\t_adb-tls-pairing._tcp\tnot-an-ip\nadb-y\t_adb-tls-connect._tcp\t10.0.0.1:5555\n";
+        let (pair_eps, conn_eps) = parse_mdns(raw);
+        assert!(pair_eps.is_empty(), "malformed endpoint should be dropped");
+        assert_eq!(conn_eps, vec!["10.0.0.1:5555"]);
+    }
+
+    #[test]
+    fn mdns_parser_handles_empty_and_header_only_output() {
+        let (p, c) = parse_mdns("");
+        assert!(p.is_empty() && c.is_empty());
+        // adb sometimes prints a header line before the records
+        let (p2, c2) = parse_mdns("List of mDNS services\n");
+        assert!(p2.is_empty() && c2.is_empty());
+    }
+
+    // ── pair_connect input validation (all checks happen BEFORE adb is touched) ────────────────────────────────────
+
+    // The next tests never touch adb, the phone or the network.
+
+    #[test]
+    fn pair_inputs_accept_exactly_six_digits_and_trim_spaces() {
+        let check = |code: &str, ip: &str| pair_inputs(&json!({ "pairCode": code, "deviceIp": ip }));
+        assert_eq!(check("123456", "").unwrap(), ("123456".to_string(), String::new()));
+        assert_eq!(check(" 492817 ", " 192.168.1.5:38765 ").unwrap(), ("492817".to_string(), "192.168.1.5:38765".to_string()));
+        for bad in ["", "12345", "1234567", "12345a", "abcdef", "12 456"] {
+            let e = check(bad, "").unwrap_err();
+            assert_eq!(e.0, 400, "{bad:?}");
+            assert!(e.1.contains("6 DIGITS"), "{bad:?}");
+        }
+        assert_eq!(pair_inputs(&json!({ "action": "pair_connect" })).unwrap_err().0, 400);   // no code at all
+    }
+
+    #[test]
+    fn pair_inputs_refuse_a_bad_pairing_address() {
+        for bad_ip in ["evil; calc", "192.168.1.256:38765", "192.168.1.5", "192.168.1.5:0", "hostname:38765", "192.168.1.5:38765 -x"] {
+            let e = pair_inputs(&json!({ "pairCode": "123456", "deviceIp": bad_ip })).unwrap_err();
+            assert_eq!(e.0, 400, "{bad_ip:?}");
+            assert!(e.1.contains("IP:PORT"), "{bad_ip:?}");
+        }
+    }
+
+    #[test]
+    fn control_refuses_bad_pairing_input_before_touching_adb() {
+        // Validation comes first, so these never start adb.
+        let (status, body) = control(br#"{"action":"pair_connect","pairCode":"12345"}"#);
+        assert_eq!(status, 400);
+        assert!(body.contains("6 DIGITS"));
+        assert_eq!(control(br#"{"action":"pair_connect","pairCode":"123456","deviceIp":"evil; calc"}"#).0, 400);
+    }
+
+    #[test]
+    fn a_connect_address_is_never_accepted_for_pairing() {
+        let pair = vec!["10.89.22.81:37499".to_string()];
+        let conn = vec!["10.89.22.81:44643".to_string()];
+        assert!(is_connect_address("10.89.22.81:44643", &pair, &conn));
+        assert!(!is_connect_address("10.89.22.81:37499", &pair, &conn));
+        assert!(!is_connect_address("10.89.22.81:1111", &pair, &conn));
+    }
+
+    #[test]
+    fn find_phone_says_what_was_found() {
+        let pair = vec!["10.89.22.81:37499".to_string()];
+        let conn = vec!["10.89.22.81:44643".to_string()];
+        let found = describe_discovery(&pair, &conn);
+        assert!(found.contains("37499") && found.contains("6-DIGIT"));
+        assert!(describe_discovery(&[], &conn).contains("NO PAIRING DIALOG"));
+        assert!(describe_discovery(&[], &[]).contains("NO PHONE FOUND"));
+    }
+
+    #[test]
+    fn mdns_lines_parse_with_tabs_as_adb_prints_them_and_with_spaces() {
+        // the real output seen on this PC (tabs), and the same text with spaces
+        let tabs = "List of discovered mdns services
+adb-10BFCF0N9C005NX-KDu5iQ	_adb-tls-pairing._tcp	10.89.22.81:39011
+adb-10BFCF0N9C005NX-KDu5iQ	_adb-tls-connect._tcp	10.89.22.81:44643
+";
+        let spaces = tabs.replace("	", "   ");
+        for raw in [tabs.to_string(), spaces] {
+            let (p, c) = parse_mdns(&raw);
+            assert_eq!(p, vec!["10.89.22.81:39011"]);
+            assert_eq!(c, vec!["10.89.22.81:44643"]);
+        }
+    }
+
+    #[test]
+    fn ip_extraction_works_for_valid_endpoints() {
+        assert_eq!(ip_of("192.168.1.5:38765"), "192.168.1.5");
+        assert_eq!(ip_of("10.0.0.2:5555"), "10.0.0.2");
+    }
+
+    #[test]
+    fn connect_endpoint_matching_uses_same_ip_as_pairing_endpoint() {
+        // Simulate two connect endpoints; only the one on the pairing IP should be chosen.
+        let raw_mdns = "a\t_adb-tls-connect._tcp\t192.168.1.5:5555\nb\t_adb-tls-connect._tcp\t10.0.0.9:5555\n";
+        let (_, conn_eps) = parse_mdns(raw_mdns);
+        let pair_ip = "192.168.1.5";
+        let matched: Vec<_> = conn_eps.into_iter().filter(|ep| ip_of(ep) == pair_ip).collect();
+        assert_eq!(matched, vec!["192.168.1.5:5555"]);
+    }
+
     #[test]
     fn unlisted_actions_are_refused_before_adb_is_touched() {
-        for a in ["format_phone", "shell", "add_device", "install", ""] {
+        for a in ["format_phone", "shell", "add_device", "install", "", "pair_bluetooth"] {
             let (status, body) = control(format!(r#"{{"action":"{a}"}}"#).as_bytes());
             assert_eq!(status, 501, "{a}");
             assert!(body.contains("NOT AVAILABLE"), "{a}");
         }
         assert_eq!(control(b"not json").0, 400);
-    }
-
-    #[test]
-    fn a_connect_request_with_a_bad_address_is_refused() {
-        assert_eq!(control(br#"{"action":"pair_bluetooth","deviceIp":"evil; calc"}"#).0, 400);
-        assert_eq!(control(br#"{"action":"pair_bluetooth"}"#).0, 400);
     }
 
     /// Needs a real phone: `cargo test devices::tests::live_buttons -- --ignored --nocapture`
@@ -487,6 +792,38 @@ mod tests {
         println!("{}", serde_json::to_string_pretty(&reply).unwrap());
         assert!(reply["totalConnected"].as_u64().unwrap_or(0) >= 1, "no connected phone found");
         assert_eq!(reply["hasPhysicalDevice"], false);
+    }
+
+    fn listed(state: &str) -> Listed { Listed { serial: "ABC123".into(), state: state.into(), model: None } }
+
+    #[test]
+    fn the_panel_is_told_why_no_phone_is_usable() {
+        // adb itself could not run: the fix is how D-ASK was started
+        assert!(troubleshoot(false, &[]).contains("Start-D-ASK.cmd"));
+        // adb runs but lists nothing
+        let none = troubleshoot(true, &[]);
+        assert!(none.contains("data cable") && none.contains("Wireless debugging"));
+        // a new phone that has not been allowed yet: the most common first-connection case
+        let unauth = troubleshoot(true, &[listed("unauthorized")]);
+        assert!(unauth.contains("Allow") && unauth.contains("Revoke USB debugging authorizations"));
+        assert!(troubleshoot(true, &[listed("offline")]).contains("offline"));
+        assert!(troubleshoot(true, &[listed("something-new")]).contains("does not recognise"));
+        // a usable phone: no warning, even if another one is still unauthorized
+        assert_eq!(troubleshoot(true, &[listed("device")]), "");
+        assert_eq!(troubleshoot(true, &[listed("unauthorized"), listed("device")]), "");
+    }
+
+    #[test]
+    fn diagnostics_carry_the_fields_the_page_expects() {
+        let d = diagnostics_json(true, "C:\\x\\adb.exe", &[Listed { serial: "192.168.1.5:5555".into(), state: "unauthorized".into(), model: None }]);
+        for key in ["adbRunning", "adbPath", "devicesFoundCount", "usbAttached", "wirelessAttached", "unauthorizedCount", "iphoneDetected", "troubleshootStep"] {
+            assert!(d.get(key).is_some(), "{key}");
+        }
+        assert_eq!(d["wirelessAttached"], true);
+        assert_eq!(d["usbAttached"], false);
+        assert_eq!(d["unauthorizedCount"], 1);
+        let first: Value = serde_json::from_str(&empty_reply()).unwrap();
+        assert_eq!(first["diagnostics"]["troubleshootStep"], "");   // nothing is claimed before the first scan has finished
     }
 
     #[test]

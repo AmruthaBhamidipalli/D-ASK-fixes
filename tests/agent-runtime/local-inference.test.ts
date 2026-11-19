@@ -497,7 +497,10 @@ async function main(): Promise<void> {
     }
 
     {
-      const s = mkSup({ maxRestarts: 2 }, { FAKE_CRASH_AFTER_MS: "150" });
+      // 600 ms (was 150): the fake server must be READY before it crashes, as in U7. At 150 ms the crash could land between the supervisor's
+      // health check and its unauthenticated-request probe, which reported "did not reject an unauthenticated request (HTTP 0)" (fatal, no restart
+      // counted) on a loaded machine: the check passed or failed at random (102 or 103 passing on identical code).
+      const s = mkSup({ maxRestarts: 2 }, { FAKE_CRASH_AFTER_MS: "600" });
       await s.start().catch(() => {});
       for (let i = 0; i < 200 && s.status().state !== "failed"; i++) await sleep(50);
       check(s.status().state === "failed" && s.status().restarts === 3, "U8 repeated crashes → failed after maxRestarts (bounded)", s.status());

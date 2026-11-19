@@ -63,7 +63,10 @@ async function main() {
         { cwd: path.join(process.cwd(), "src", "hud-native"), env: { ...process.env, DASK_STT_FIXTURE: out, DASK_STT_EXPECT: expect }, encoding: "utf8", shell: true });
       const t = /TRANSCRIPT \[(\d+) ms\]: (.*)/.exec(r.stdout ?? "");
       console.log(`  (recognised: "${t?.[2]?.trim() ?? ""}" in ${t?.[1] ?? "?"} ms)`);
-      check(r.status === 0, "T7 audio encoded by the HUD code is transcribed by the local recognizer (>= 70 % of words)", (r.stdout ?? "").slice(-400));
+      // cargo's own errors go to stderr: show them. T7 needs `cargo` on PATH with the HUD's Rust/MSVC build settings (RUSTUP_HOME, CARGO_HOME,
+      // LIB and the linker flags); without them it used to fail with an empty message.
+      if (r.error || /not recognized|not found/i.test(r.stderr ?? "")) console.log("  (T7 could not start cargo: put the Rust toolchain on PATH and set the HUD build settings, then run this again)");
+      check(r.status === 0, "T7 audio encoded by the HUD code is transcribed by the local recognizer (>= 70 % of words)", ((r.stdout ?? "") + (r.stderr ?? "")).slice(-600));
       fs.rmSync(src, { force: true }); fs.rmSync(out, { force: true });
     }
   }
